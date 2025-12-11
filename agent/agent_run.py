@@ -3,36 +3,24 @@ import json
 import os
 import ast
 from tools import tools_api
-from google import genai
 from argparse import ArgumentParser
 from tqdm import tqdm
 from mask import parse_masks_from_conversation
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 def parse_args():
     parser = ArgumentParser(description="Agent for answering questions with inside model.")
-    parser.add_argument('--project_id', type=str, required=True, help='Google Cloud Project ID')
-    parser.add_argument('--location', type=str, default='global', help='Location for the Vertex AI resources')
-    parser.add_argument('--think_mode', action='store_true', help='Enable think mode for the agent')
     parser.add_argument('--output_path', type=str, default='../output/test.json', help='Path to save the results')
+    parser.add_argument('--quantization', type=str, default='none', choices=['none', '4bit', '8bit'],
+                        help='Quantization mode: none (full precision), 4bit, or 8bit')
     return parser.parse_args()
 
 class Agent:
-    def __init__(self, project_id, location, tools_api, input, think_mode=False):
+    def __init__(self, model, tokenizer, tools_api, input):
+        self.model = model          
+        self.tokenizer = tokenizer
         self.tools_api = tools_api
-        self.client = genai.Client(vertexai=True, project=project_id, location=location)
-        
-        if think_mode:
-            self.chat = self.client.chats.create(
-                model="gemini-2.5-flash-preview-05-20",
-                config=genai.types.GenerateContentConfig(
-                    thinking_config=genai.types.ThinkingConfig(thinking_budget=128), temperature=0.2)
-                )
-        else:
-            self.chat = self.client.chats.create(
-                model="gemini-2.5-flash-preview-05-20",
-                config=genai.types.GenerateContentConfig(temperature=0.2)
-            )
-
         self.messages = []
         self.conversation = []
         self.prompt_preamble = open('prompt/agent_example.txt', 'r').read()
@@ -40,6 +28,37 @@ class Agent:
         self.input = input
         self.masks = None
         self.question = None
+
+    def generate_response(self, new_user_content):
+        # Append new user message to history
+        self.messages.append({"role": "user", "content": new_user_content})
+        
+        # Format history into a single string
+        text = self.tokenizer.apply_chat_template(
+            self.messages, 
+            tokenize=False, 
+            add_generation_prompt=True
+        )
+        
+        # Tokenize and Generate
+        model_inputs = self.tokenizer([text], return_tensors="pt").to(self.model.device)
+        
+        with torch.no_grad():
+            generated_ids = self.model.generate(
+                **model_inputs,
+                max_new_tokens=512
+            )
+        
+        # Decode ONLY the new response
+        generated_ids = [
+            output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
+        ]
+        response_text = self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
+        
+        # Append assistant response to history
+        self.messages.append({"role": "assistant", "content": response_text})
+        
+        return response_text
 
     def set_masks(self):
         conversation = self.input['rephrase_conversations'][0]['value']
@@ -50,51 +69,53 @@ class Agent:
             raise ValueError("No valid masks found in the conversation.")
     
     def format_answer(self):
-        answer = self.chat.send_message(self.answer_preamble)
-        answer = answer.text.strip()
-        if answer in self.masks:
-            return self.masks[answer].region_id
-        else:
-            return answer
+        # Simply call generate with the answer preamble
+        return self.generate_response(self.answer_preamble)
 
     def set_question(self):
-        self.messages = []
+        self.messages = [] # Reset history
         self.question = self.input['rephrase_conversations'][0]['value']
         full_prompt = self.prompt_preamble.replace("<question>", self.question)
-        self.messages.append({"role": "user", "content": full_prompt})
+        self.messages.append({"role": "system", "content": "You are a helpful agent."})
         self.tools_api.update_image('../data/test/images/' + self.input['image'])
-        return self._conversation_loop()
+        
+        # Call loop passing the initial prompt as the first "trigger"
+        return self._conversation_loop(initial_prompt=full_prompt)
 
-    def _conversation_loop(self, budget=10):
+    def _conversation_loop(self, budget=10, initial_prompt=None):
         usage = 0
         execute_flag = False
+        
+        # Handle the very first message
+        current_input = initial_prompt
+        
         while usage < budget:
             usage += 1
-            # Compose the prompt from the conversation history
-            latest_message = self.messages[-1]["content"]
-            response = self.chat.send_message(latest_message)
-            assistant_text = response.text.strip()
-            self.messages.append({"role": "assistant", "content": assistant_text})
-
-            # Check for <execute> command
+            
+            # Generate
+            assistant_text = self.generate_response(current_input)
+            
+            # Check for <execute>
             execute_match = re.search(r"<execute>(.*?)</execute>", assistant_text, re.DOTALL)
             if execute_match:
                 execute_flag = True
                 command = execute_match.group(1).strip()
-                result = self._execute_function(command)
-                # Send the result back to Gemini
-                self.messages.append({"role": "user", "content": f"{result}"})
-                continue  # Continue the loop
+                try:
+                    result = self._execute_function(command)
+                    # The result becomes the input for the next turn
+                    current_input = f"{result}"
+                except Exception as e:
+                    current_input = f"Error: {str(e)}"
+                continue
 
-            # Check for <answer> tag
+            # Check for <answer>
             answer_match = re.search(r"<answer>(.*?)</answer>", assistant_text, re.DOTALL)
-            if answer_match and execute_flag:
-                final_answer = answer_match.group(1).strip()
-                self.messages.append({"role": "assistant", "content": final_answer})
-                return final_answer
+            if answer_match: # Removed 'and execute_flag' strict check if you want it to be more robust
+                return answer_match.group(1).strip()
 
-            print("No valid action found. Ending interaction.")
-            raise ValueError("No valid action found in the assistant's response.")
+            # If no tags, maybe provide a hint or break
+            print("No valid action found.")
+            break
 
     def _execute_function(self, command):
         """Parses and executes a function call from Gemini."""
@@ -158,10 +179,40 @@ class Agent:
 
 if __name__ == "__main__":
     args = parse_args()
-    PROJECT_ID = args.project_id
-    LOCATION = args.location
-    USE_THINK_MODE = args.think_mode
     output_path = args.output_path
+
+    print("Loading Qwen model...")
+    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-7B-Instruct")
+    # Configure quantization
+    if args.quantization == '4bit':
+        quantization_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True
+        )
+        model = AutoModelForCausalLM.from_pretrained(
+            "Qwen/Qwen2.5-7B-Instruct",
+            quantization_config=quantization_config,
+            device_map="auto"
+        )
+    elif args.quantization == '8bit':
+        quantization_config = BitsAndBytesConfig(
+            load_in_8bit=True
+        )
+        model = AutoModelForCausalLM.from_pretrained(
+            "Qwen/Qwen2.5-7B-Instruct",
+            quantization_config=quantization_config,
+            device_map="auto"
+        )
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            "Qwen/Qwen2.5-7B-Instruct", 
+            torch_dtype="auto", 
+            device_map="auto"
+        )
+    
+    print(f"Model loaded with quantization: {args.quantization}")
 
     error_budget = 1
 
@@ -197,7 +248,7 @@ if __name__ == "__main__":
         if id in answered_ids:
             continue
             
-        agent = Agent(PROJECT_ID, LOCATION, tools, item, think_mode=USE_THINK_MODE)
+        agent = Agent(model, tokenizer, tools, item)
         agent.set_masks()
         
         attempt = 0

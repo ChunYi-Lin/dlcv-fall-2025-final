@@ -1,9 +1,55 @@
 import re
 import json
+from argparse import ArgumentParser
 from tqdm import tqdm
-from google import genai
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
-client = genai.Client(api_key='')  # Replace with your actual API key
+def parse_args():
+    parser = ArgumentParser(description="Rephrase questions with mask replacement.")
+    parser.add_argument('--test', action='store_true', help='Use test set instead of val set')
+    parser.add_argument('--quantization', type=str, default='none', choices=['none', '4bit', '8bit'],
+                        help='Quantization mode: none (full precision), 4bit, or 8bit')
+    return parser.parse_args()
+
+def load_model(quantization='none'):
+    MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct"
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    
+    if quantization == '4bit':
+        quantization_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True
+        )
+        model = AutoModelForCausalLM.from_pretrained(
+            MODEL_NAME,
+            quantization_config=quantization_config,
+            device_map="auto"
+        )
+    elif quantization == '8bit':
+        quantization_config = BitsAndBytesConfig(
+            load_in_8bit=True
+        )
+        model = AutoModelForCausalLM.from_pretrained(
+            MODEL_NAME,
+            quantization_config=quantization_config,
+            device_map="auto"
+        )
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            MODEL_NAME,
+            torch_dtype="auto",
+            device_map="auto"
+        )
+    
+    print(f"Model loaded with quantization: {quantization}")
+    return model, tokenizer
+
+# These will be initialized in main
+model = None
+tokenizer = None
 
 prompt = open('agent/prompt/rephrase.txt', 'r').read()
 
@@ -15,16 +61,30 @@ def verify(original_question, rephrased_question: str) -> bool:
 def rephrase_question(question: str) -> str:
     question = question.replace('<image>\n', '')
     input_text = prompt.replace('<input>', question)
-    response = client.models.generate_content(
-            model="gemini-2.5-pro-preview-06-05",
-            contents=(
-                input_text
-            ),
-            config=genai.types.GenerateContentConfig(
-                thinking_config=genai.types.ThinkingConfig(thinking_budget=128)
-            )
-        )
-    return response.text.strip()
+    
+    messages = [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": input_text}
+    ]
+
+    text = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True
+    )
+
+    model_inputs = tokenizer([text], return_tensors="pt").to(model.device)
+
+    generated_ids = model.generate(
+        **model_inputs,
+        max_new_tokens=256,
+    )
+
+    generated_ids = [
+        output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
+    ]
+    response = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
+    return response.strip()
 
 def replace_masks_with_objects(original_question: str) -> str:
     original_question = original_question.replace('<image>\n', '')
@@ -86,10 +146,12 @@ def replace_masks_with_objects(original_question: str) -> str:
 
 
 if __name__ == "__main__":
+    args = parse_args()
     
-    test = True
+    # Load model with quantization option
+    model, tokenizer = load_model(args.quantization)
 
-    if test:
+    if args.test:
         input_path = 'data/test/test.json'
         output_path = 'data/test/rephrased_test.json'
     else:
