@@ -27,8 +27,6 @@
        pip install torch==2.2.1 torchvision==0.17.1 torchaudio==2.2.1 --index-url https://download.pytorch.org/whl/cu118
        pip install -r requirements.txt
 
-5. Install Google API and Vertex AI packages following the [official guide](https://cloud.google.com/vertex-ai/generative-ai/docs/start/quickstarts/quickstart-multimodal#gen-ai-sdk-for-python).
-
 ---
 
 ## 📦 Preparation
@@ -37,9 +35,7 @@
 
 2. Place the downloaded files in corresponding directory following the below Project Structure.
 
-3. Setup a [Vertex AI API project ID](https://cloud.google.com/vertex-ai/generative-ai/docs/start/quickstarts/quickstart-multimodal#gen-ai-sdk-for-python).
-
-4. Download the [AI City Challenge PhysicalAI Spatial Intelligence dataset](https://huggingface.co/datasets/nvidia/PhysicalAI-Spatial-Intelligence-Warehouse) and put in data dir following project structure.
+3. Download the [AI City Challenge PhysicalAI Spatial Intelligence dataset](https://huggingface.co/datasets/nvidia/PhysicalAI-Spatial-Intelligence-Warehouse) and put in data dir following project structure.
 
 ---
 
@@ -67,14 +63,13 @@
 
 ## 🧠 Usage
 
-### 1. Inference on test set (For full reproduce of our results)
+### 1. Inference on test set
 
-```
-
+```bash
 cd agent
-python agent_run.py --project_id <your Vertex AI API>
-
+python agent_run.py --output_path ../output/test.json --quantization none
 ```
+
 Additionally, some QA might failed because Gemini return invalid format or answer, run again with thinking mode enabled can solve this issue. 
 Running this command will re-run those failure cases.
 ```
@@ -128,4 +123,5 @@ If you find this work useful, please cite our ICCV Workshop 2025 paper, thank yo
     year      = {2025},
     pages     = {5224-5228}
 }
+```
 

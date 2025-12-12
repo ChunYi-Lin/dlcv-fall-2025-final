@@ -182,7 +182,12 @@ if __name__ == "__main__":
     output_path = args.output_path
 
     print("Loading Qwen model...")
-    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-7B-Instruct")
+    
+    # POINT TO YOUR LOCAL FOLDER
+    MODEL_PATH = "./Qwen2.5-7B-Instruct" 
+    
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
+    
     # Configure quantization
     if args.quantization == '4bit':
         quantization_config = BitsAndBytesConfig(
@@ -192,24 +197,24 @@ if __name__ == "__main__":
             bnb_4bit_use_double_quant=True
         )
         model = AutoModelForCausalLM.from_pretrained(
-            "Qwen/Qwen2.5-7B-Instruct",
+            MODEL_PATH,
             quantization_config=quantization_config,
-            device_map="auto"
+            device_map="cuda:0"
         )
     elif args.quantization == '8bit':
         quantization_config = BitsAndBytesConfig(
             load_in_8bit=True
         )
         model = AutoModelForCausalLM.from_pretrained(
-            "Qwen/Qwen2.5-7B-Instruct",
+            MODEL_PATH,
             quantization_config=quantization_config,
-            device_map="auto"
+            device_map="cuda:0"
         )
     else:
         model = AutoModelForCausalLM.from_pretrained(
-            "Qwen/Qwen2.5-7B-Instruct", 
+            MODEL_PATH,
             torch_dtype="auto", 
-            device_map="auto"
+            device_map="cuda:0"
         )
     
     print(f"Model loaded with quantization: {args.quantization}")

@@ -13,8 +13,10 @@ def parse_args():
     return parser.parse_args()
 
 def load_model(quantization='none'):
-    MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct"
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    MODEL_PATH = "./Qwen2.5-7B-Instruct" 
+
+    print(f"Loading from local path: {MODEL_PATH}")
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
     
     if quantization == '4bit':
         quantization_config = BitsAndBytesConfig(
@@ -24,24 +26,24 @@ def load_model(quantization='none'):
             bnb_4bit_use_double_quant=True
         )
         model = AutoModelForCausalLM.from_pretrained(
-            MODEL_NAME,
+            MODEL_PATH,
             quantization_config=quantization_config,
-            device_map="auto"
+            device_map="cuda:0"
         )
     elif quantization == '8bit':
         quantization_config = BitsAndBytesConfig(
             load_in_8bit=True
         )
         model = AutoModelForCausalLM.from_pretrained(
-            MODEL_NAME,
+            MODEL_PATH,
             quantization_config=quantization_config,
-            device_map="auto"
+            device_map="cuda:0"
         )
     else:
         model = AutoModelForCausalLM.from_pretrained(
-            MODEL_NAME,
+            MODEL_PATH,
             torch_dtype="auto",
-            device_map="auto"
+            device_map="cuda:0"
         )
     
     print(f"Model loaded with quantization: {quantization}")

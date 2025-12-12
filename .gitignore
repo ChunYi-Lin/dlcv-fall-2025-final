@@ -3,6 +3,7 @@ distance_est/ckpt/*
 !distance_est/ckpt/.gitkeep
 inside_pred/ckpt/*
 !inside_pred/ckpt/.gitkeep
+Qwen2.5-7B-Instruct/
 
 # Or ignore all .pth files anywhere:
 # *.pth
