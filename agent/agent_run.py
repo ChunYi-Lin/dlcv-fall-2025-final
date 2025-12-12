@@ -9,23 +9,38 @@ from mask import parse_masks_from_conversation
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
+THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.abspath(os.path.join(THIS_DIR, os.pardir))
+
+def convs_output_path_for(output_path: str) -> str:
+    root, ext = os.path.splitext(output_path)
+    return f"{root}_convs{ext or '.json'}"
+
 def parse_args():
     parser = ArgumentParser(description="Agent for answering questions with inside model.")
-    parser.add_argument('--output_path', type=str, default='../output/test.json', help='Path to save the results')
+    parser.add_argument('--split', type=str, default='test', choices=['train', 'val', 'test'],
+                        help='Dataset split to run on')
+    parser.add_argument('--json_path', type=str, default=None,
+                        help='Path to input JSON (defaults to data/<split>/rephrased_<split>.json)')
+    parser.add_argument('--image_dir', type=str, default=None,
+                        help='Image directory (defaults to data/<split>/images)')
+    parser.add_argument('--output_path', type=str, default=None,
+                        help='Path to save the results (defaults to output/<split>.json)')
     parser.add_argument('--quantization', type=str, default='none', choices=['none', '4bit', '8bit'],
                         help='Quantization mode: none (full precision), 4bit, or 8bit')
     return parser.parse_args()
 
 class Agent:
-    def __init__(self, model, tokenizer, tools_api, input):
+    def __init__(self, model, tokenizer, tools_api, input, image_dir: str):
         self.model = model          
         self.tokenizer = tokenizer
         self.tools_api = tools_api
         self.messages = []
         self.conversation = []
-        self.prompt_preamble = open('prompt/agent_example.txt', 'r').read()
-        self.answer_preamble = open('prompt/answer.txt', 'r').read()
+        self.prompt_preamble = open(os.path.join(THIS_DIR, 'prompt', 'agent_example.txt'), 'r').read()
+        self.answer_preamble = open(os.path.join(THIS_DIR, 'prompt', 'answer.txt'), 'r').read()
         self.input = input
+        self.image_dir = image_dir
         self.masks = None
         self.question = None
 
@@ -77,7 +92,7 @@ class Agent:
         self.question = self.input['rephrase_conversations'][0]['value']
         full_prompt = self.prompt_preamble.replace("<question>", self.question)
         self.messages.append({"role": "system", "content": "You are a helpful agent."})
-        self.tools_api.update_image('../data/test/images/' + self.input['image'])
+        self.tools_api.update_image(os.path.join(self.image_dir, self.input['image']))
         
         # Call loop passing the initial prompt as the first "trigger"
         return self._conversation_loop(initial_prompt=full_prompt)
@@ -179,12 +194,29 @@ class Agent:
 
 if __name__ == "__main__":
     args = parse_args()
-    output_path = args.output_path
+    split = args.split
+    output_path = args.output_path or os.path.join(REPO_ROOT, 'output', f'{split}.json')
+    convs_output_path = convs_output_path_for(output_path)
+    json_path = args.json_path or os.path.join(REPO_ROOT, 'data', split, f'rephrased_{split}.json')
+    image_dir = args.image_dir or os.path.join(REPO_ROOT, 'data', split, 'images')
+
+    if not os.path.exists(json_path):
+        raise FileNotFoundError(
+            f"Input JSON not found: {json_path} (pass --json_path to override)"
+        )
+    if not os.path.isdir(image_dir):
+        raise FileNotFoundError(
+            f"Image directory not found: {image_dir} (pass --image_dir to override)"
+        )
+
+    output_dir = os.path.dirname(output_path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
 
     print("Loading Qwen model...")
     
     # POINT TO YOUR LOCAL FOLDER
-    MODEL_PATH = "./Qwen2.5-7B-Instruct" 
+    MODEL_PATH = os.path.join(REPO_ROOT, "Qwen2.5-7B-Instruct")
     
     tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
     
@@ -226,26 +258,31 @@ if __name__ == "__main__":
     convs = []
     answered_ids = set()
 
+    print('Split:', split)
+    print('Input JSON:', json_path)
+    print('Image dir:', image_dir)
     print('Saving results to:', output_path)
+    print('Saving conversations to:', convs_output_path)
 
     if prev_results_path and os.path.exists(prev_results_path):
         with open(prev_results_path, 'r') as f:
             prev_results = json.load(f)
             results = [item for item in prev_results if item['normalized_answer'] != "-1"]
-        with open(prev_results_path.replace('test', 'test_convs'), 'r') as f:
-            prev_convs = json.load(f)
-            convs = [item for item in prev_convs if item['normalized_answer'] != "-1"]
+        if os.path.exists(convs_output_path):
+            with open(convs_output_path, 'r') as f:
+                prev_convs = json.load(f)
+                convs = [item for item in prev_convs if item['normalized_answer'] != "-1"]
         answered_ids = {item['id'] for item in results}
         print(f"Loaded {len(results)} previous results.")
 
-    tools = tools_api(dist_model_cfg={'model_path': '../distance_est/ckpt/epoch_5_iter_6831.pth'}, 
-                      inside_model_cfg={'model_path': '../inside_pred/ckpt/epoch_4.pth'},
-                      small_dist_model_cfg={'model_path': '../distance_est/ckpt/3m_epoch6.pth'},
+    tools = tools_api(dist_model_cfg={'model_path': os.path.join(REPO_ROOT, 'distance_est', 'ckpt', 'epoch_5_iter_6831.pth')}, 
+                      inside_model_cfg={'model_path': os.path.join(REPO_ROOT, 'inside_pred', 'ckpt', 'epoch_4.pth')},
+                      small_dist_model_cfg={'model_path': os.path.join(REPO_ROOT, 'distance_est', 'ckpt', '3m_epoch6.pth')},
                       resize=(360, 640),
                       mask_IoU_thres=0.3, inside_thres=0.5,
                       cascade_dist_thres=300, clamp_distance_thres=25)
 
-    with open('../data/test/rephrased_test.json', 'r') as f:
+    with open(json_path, 'r') as f:
         data = json.load(f)
     
     for idx, item in tqdm(enumerate(data), total=len(data)):
@@ -253,7 +290,7 @@ if __name__ == "__main__":
         if id in answered_ids:
             continue
             
-        agent = Agent(model, tokenizer, tools, item)
+        agent = Agent(model, tokenizer, tools, item, image_dir=image_dir)
         agent.set_masks()
         
         attempt = 0
@@ -295,5 +332,5 @@ if __name__ == "__main__":
         with open(output_path, 'w') as f:
             json.dump(results, f, indent=4)
         
-        with open(output_path.replace('test', 'test_convs'), 'w') as f:
+        with open(convs_output_path, 'w') as f:
             json.dump(convs, f, indent=4)

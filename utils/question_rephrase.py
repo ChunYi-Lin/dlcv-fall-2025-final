@@ -53,40 +53,72 @@ def load_model(quantization='none'):
 model = None
 tokenizer = None
 
-prompt = open('agent/prompt/rephrase.txt', 'r').read()
+TYPE_PROMPT = open('agent/prompt/rephrase.txt', 'r').read()
 
-def verify(original_question, rephrased_question: str) -> bool:
-    original_count = original_question.count('<') + original_question.count('>')
-    rephrased_count = rephrased_question.count('<') + rephrased_question.count('>')
-    return original_count == rephrased_count
+OBJECT_TYPES = ('pallet', 'transporter', 'shelf', 'buffer')
+OBJECT_TYPE_RE = re.compile(r"(pallet|transporter|shelf|buffer)", re.IGNORECASE)
 
-def rephrase_question(question: str) -> str:
-    question = question.replace('<image>\n', '')
-    input_text = prompt.replace('<input>', question)
-    
-    messages = [
-        {"role": "system", "content": "You are a helpful assistant."},
-        {"role": "user", "content": input_text}
-    ]
+def _extract_object_type(text: str):
+    match = OBJECT_TYPE_RE.search(text)
+    if not match:
+        return None
+    return match.group(1).lower()
 
-    text = tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True
+def _mark_nth_mask(question: str, mask_index: int, marker: str = "<target_mask>") -> str:
+    matches = list(re.finditer(r"<mask>", question))
+    if mask_index < 0 or mask_index >= len(matches):
+        raise ValueError(
+            f"mask_index {mask_index} out of range; found {len(matches)} '<mask>' tokens"
+        )
+    start, end = matches[mask_index].span()
+    return question[:start] + marker + question[end:]
+
+def predict_object_type(question_with_target_mask: str) -> str:
+    question_with_target_mask = question_with_target_mask.replace('<image>\n', '')
+    if "<target_mask>" not in question_with_target_mask:
+        raise ValueError("predict_object_type expects '<target_mask>' in the input question")
+
+    prompt_text = TYPE_PROMPT.replace("<input>", question_with_target_mask)
+    strict_prompt_text = (
+        "Return exactly one word from: pallet, transporter, shelf, buffer.\n"
+        f"Sentence: {question_with_target_mask}\n"
+        "Output:"
     )
 
-    model_inputs = tokenizer([text], return_tensors="pt").to(model.device)
+    last_response = None
+    for user_content in (prompt_text, strict_prompt_text):
+        messages = [
+            {"role": "system", "content": "You are a strict classifier. Reply with a single word."},
+            {"role": "user", "content": user_content},
+        ]
 
-    generated_ids = model.generate(
-        **model_inputs,
-        max_new_tokens=256,
+        text = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+
+        model_inputs = tokenizer([text], return_tensors="pt").to(model.device)
+
+        generated_ids = model.generate(
+            **model_inputs,
+            max_new_tokens=5,
+            do_sample=False,
+        )
+
+        generated_ids = [
+            output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
+        ]
+        last_response = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
+
+        object_type = _extract_object_type(last_response)
+        if object_type in OBJECT_TYPES:
+            return object_type
+
+    raise ValueError(
+        "Could not extract a valid object type from model output. "
+        f"Expected one of {OBJECT_TYPES}, got: {last_response!r}"
     )
-
-    generated_ids = [
-        output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
-    ]
-    response = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
-    return response.strip()
 
 def replace_masks_with_objects(original_question: str) -> str:
     original_question = original_question.replace('<image>\n', '')
@@ -101,23 +133,22 @@ def replace_masks_with_objects(original_question: str) -> str:
     modified_tokens = []
     last_object = None
     last_object_updated = False
+    mask_index = -1
 
     for i, token in enumerate(tokens):
         if token == '<mask>':
+            mask_index += 1
             
             if not last_object_updated:
-                rephrase = rephrase_question(original_question)
-                print(f"Original question: {original_question}")
-                print(f"Rephrased question: {rephrase}")
-                if not verify(original_question, rephrase):
-                    import pdb; pdb.set_trace()
-                return rephrase   
+                marked_question = _mark_nth_mask(original_question, mask_index)
+                last_object = predict_object_type(marked_question)
+                last_object_updated = True
 
             replacement = f"<{last_object}_{object_counters[last_object]}>"
             object_counters[last_object] += 1
             modified_tokens.append(replacement)
         else:
-            if tokens[i - 1] == '<mask>':
+            if i > 0 and tokens[i - 1] == '<mask>':
                 last_object_updated = False
             if token.lower() == 'shelves':
                 token_lower = 'shelf'
