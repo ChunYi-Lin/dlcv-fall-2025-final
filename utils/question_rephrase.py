@@ -16,7 +16,28 @@ from agent.llm import VLLMConfig, load_vllm_chat_llm
 
 def parse_args():
     parser = ArgumentParser(description="Rephrase questions with mask replacement.")
-    parser.add_argument('--test', action='store_true', help='Use test set instead of val set')
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        '--split',
+        type=str,
+        default='val',
+        choices=['train', 'val', 'test'],
+        help="Dataset split to rephrase (default: val)",
+    )
+    group.add_argument('--train', action='store_true', help='Alias for --split train')
+    group.add_argument('--test', action='store_true', help='Alias for --split test')
+    parser.add_argument(
+        '--json_path',
+        type=str,
+        default=None,
+        help='Path to input JSON (defaults to <repo>/data/<split>/<split>.json)',
+    )
+    parser.add_argument(
+        '--output_path',
+        type=str,
+        default=None,
+        help='Path to output JSON (defaults to <repo>/data/<split>/rephrased_<split>.json)',
+    )
     parser.add_argument('--quantization', type=str, default='none', choices=['none', '4bit', '8bit'],
                         help='Quantization mode: none (full precision), 4bit, or 8bit')
     parser.add_argument(
@@ -230,12 +251,17 @@ if __name__ == "__main__":
     # Load model with quantization option
     llm = load_model(args)
 
-    if args.test:
-        input_path = 'data/test/test.json'
-        output_path = 'data/test/rephrased_test.json'
-    else:
-        input_path = 'data/val/val.json'
-        output_path = 'data/val/rephrased_val.json'
+    split = args.split
+    if args.train:
+        split = 'train'
+    elif args.test:
+        split = 'test'
+
+    input_path = args.json_path or os.path.join(REPO_ROOT, 'data', split, f'{split}.json')
+    output_path = args.output_path or os.path.join(REPO_ROOT, 'data', split, f'rephrased_{split}.json')
+    output_dir = os.path.dirname(output_path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
 
     with open(input_path, 'r') as f:
         data = json.load(f)

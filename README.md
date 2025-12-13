@@ -94,7 +94,9 @@ To pre-process the QA, you need to update the below script with your Google API 
 Note that this step is optional because data.zip already provide the processed QA data.
 
 ```
-python utils/question_rephrase.py
+python utils/question_rephrase.py --split val
+python utils/question_rephrase.py --split train
+python utils/question_rephrase.py --split test
 ```
 
 
