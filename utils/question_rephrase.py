@@ -110,6 +110,37 @@ def load_model(args):
         )
     )
 
+def _shutdown_llm(llm) -> None:
+    """Best-effort shutdown for vLLM to avoid noisy exit warnings."""
+    if llm is None:
+        return
+    engine = getattr(llm, "llm", None)
+    if engine is None:
+        return
+
+    for obj in (engine, getattr(engine, "llm_engine", None)):
+        if obj is None:
+            continue
+        for method_name in ("shutdown", "close", "terminate"):
+            method = getattr(obj, method_name, None)
+            if callable(method):
+                try:
+                    method()
+                except Exception:
+                    pass
+                return
+
+
+def _destroy_process_group() -> None:
+    """Avoid PyTorch/NCCL resource leak warnings on exit."""
+    try:
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized():
+            dist.destroy_process_group()
+    except Exception:
+        pass
+
 # This will be initialized in main
 llm = None
 
@@ -226,41 +257,45 @@ def replace_masks_with_objects(original_question: str) -> str:
 
 if __name__ == "__main__":
     args = parse_args()
-    
-    # Load model with quantization option
-    llm = load_model(args)
 
-    if args.test:
-        input_path = 'data/test/test.json'
-        output_path = 'data/test/rephrased_test.json'
-    else:
-        input_path = 'data/val/val.json'
-        output_path = 'data/val/rephrased_val.json'
+    try:
+        # Load model with quantization option
+        llm = load_model(args)
 
-    with open(input_path, 'r') as f:
-        data = json.load(f)
+        if args.test:
+            input_path = 'data/test/test.json'
+            output_path = 'data/test/rephrased_test.json'
+        else:
+            input_path = 'data/val/val.json'
+            output_path = 'data/val/rephrased_val.json'
 
-    processed_data = []
-    
-    for item in tqdm(data, desc="Processing JSON data"):
-        question_id = item.get('id')
-        rephrased_conversations = []
-        for conversation in item.get('conversations', []):
-            if conversation.get('from') == 'human':
-                original_question = conversation.get('value')
-                if original_question:
-                    rephrased_question = replace_masks_with_objects(original_question)
-                    rephrased_conversations.append({
-                        "from": "human",
-                        "value": rephrased_question
-                    })
+        with open(input_path, 'r') as f:
+            data = json.load(f)
+
+        processed_data = []
+        
+        for item in tqdm(data, desc="Processing JSON data"):
+            question_id = item.get('id')
+            rephrased_conversations = []
+            for conversation in item.get('conversations', []):
+                if conversation.get('from') == 'human':
+                    original_question = conversation.get('value')
+                    if original_question:
+                        rephrased_question = replace_masks_with_objects(original_question)
+                        rephrased_conversations.append({
+                            "from": "human",
+                            "value": rephrased_question
+                        })
+                    else:
+                        rephrased_conversations.append(conversation)
                 else:
                     rephrased_conversations.append(conversation)
-            else:
-                rephrased_conversations.append(conversation)
-        item['rephrase_conversations'] = rephrased_conversations
-        processed_data.append(item)
+            item['rephrase_conversations'] = rephrased_conversations
+            processed_data.append(item)
 
-    
-    with open(output_path, 'w') as out_file:
-        json.dump(processed_data, out_file, indent=4)
+        
+        with open(output_path, 'w') as out_file:
+            json.dump(processed_data, out_file, indent=4)
+    finally:
+        _shutdown_llm(llm)
+        _destroy_process_group()

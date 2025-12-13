@@ -16,6 +16,35 @@ except ImportError:
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.abspath(os.path.join(THIS_DIR, os.pardir))
 
+def _shutdown_llm(llm) -> None:
+    """Best-effort shutdown for vLLM to avoid noisy exit warnings."""
+    if llm is None:
+        return
+    engine = getattr(llm, "llm", None)
+    if engine is None:
+        return
+
+    for obj in (engine, getattr(engine, "llm_engine", None)):
+        if obj is None:
+            continue
+        for method_name in ("shutdown", "close", "terminate"):
+            method = getattr(obj, method_name, None)
+            if callable(method):
+                try:
+                    method()
+                except Exception:
+                    pass
+                return
+
+
+def _destroy_process_group() -> None:
+    """Avoid PyTorch/NCCL resource leak warnings on exit."""
+    try:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
+    except Exception:
+        pass
+
 def convs_output_path_for(output_path: str) -> str:
     root, ext = os.path.splitext(output_path)
     return f"{root}_convs{ext or '.json'}"
@@ -281,152 +310,157 @@ class Agent:
 
 if __name__ == "__main__":
     args = parse_args()
-    split = args.split
-    output_path = args.output_path or os.path.join(REPO_ROOT, 'output', f'{split}.json')
-    convs_output_path = convs_output_path_for(output_path)
-    json_path = args.json_path or os.path.join(REPO_ROOT, 'data', split, f'rephrased_{split}.json')
-    image_dir = args.image_dir or os.path.join(REPO_ROOT, 'data', split, 'images')
+    llm = None
+    try:
+        split = args.split
+        output_path = args.output_path or os.path.join(REPO_ROOT, 'output', f'{split}.json')
+        convs_output_path = convs_output_path_for(output_path)
+        json_path = args.json_path or os.path.join(REPO_ROOT, 'data', split, f'rephrased_{split}.json')
+        image_dir = args.image_dir or os.path.join(REPO_ROOT, 'data', split, 'images')
 
-    if not os.path.exists(json_path):
-        raise FileNotFoundError(
-            f"Input JSON not found: {json_path} (pass --json_path to override)"
-        )
-    if not os.path.isdir(image_dir):
-        raise FileNotFoundError(
-            f"Image directory not found: {image_dir} (pass --image_dir to override)"
-        )
-
-    output_dir = os.path.dirname(output_path)
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
-
-    print("Loading LLM...")
-
-    default_model_path = os.path.join(REPO_ROOT, "Qwen2.5-7B-Instruct")
-    model_name_or_path = args.model or default_model_path
-
-    if args.llm_backend == 'vllm':
-        if (args.quantization or 'none').strip().lower() != 'none':
-            raise ValueError("vLLM backend currently requires --quantization none.")
-        llm = load_vllm_chat_llm(
-            VLLMConfig(
-                model_name_or_path=model_name_or_path,
-                tokenizer_name_or_path=args.tokenizer,
-                revision=args.revision,
-                trust_remote_code=args.trust_remote_code,
-                dtype=args.dtype,
-                tensor_parallel_size=args.vllm_tensor_parallel_size,
-                gpu_memory_utilization=args.vllm_gpu_memory_utilization,
-                max_model_len=args.vllm_max_model_len,
+        if not os.path.exists(json_path):
+            raise FileNotFoundError(
+                f"Input JSON not found: {json_path} (pass --json_path to override)"
             )
-        )
-    else:
-        llm = load_hf_chat_llm(
-            HFLLMConfig(
-                model_name_or_path=model_name_or_path,
-                tokenizer_name_or_path=args.tokenizer,
-                revision=args.revision,
-                trust_remote_code=args.trust_remote_code,
-                device_map=args.device_map,
-                dtype=args.dtype,
-                quantization=args.quantization,
+        if not os.path.isdir(image_dir):
+            raise FileNotFoundError(
+                f"Image directory not found: {image_dir} (pass --image_dir to override)"
             )
+
+        output_dir = os.path.dirname(output_path)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+
+        print("Loading LLM...")
+
+        default_model_path = os.path.join(REPO_ROOT, "Qwen2.5-7B-Instruct")
+        model_name_or_path = args.model or default_model_path
+
+        if args.llm_backend == 'vllm':
+            if (args.quantization or 'none').strip().lower() != 'none':
+                raise ValueError("vLLM backend currently requires --quantization none.")
+            llm = load_vllm_chat_llm(
+                VLLMConfig(
+                    model_name_or_path=model_name_or_path,
+                    tokenizer_name_or_path=args.tokenizer,
+                    revision=args.revision,
+                    trust_remote_code=args.trust_remote_code,
+                    dtype=args.dtype,
+                    tensor_parallel_size=args.vllm_tensor_parallel_size,
+                    gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+                    max_model_len=args.vllm_max_model_len,
+                )
+            )
+        else:
+            llm = load_hf_chat_llm(
+                HFLLMConfig(
+                    model_name_or_path=model_name_or_path,
+                    tokenizer_name_or_path=args.tokenizer,
+                    revision=args.revision,
+                    trust_remote_code=args.trust_remote_code,
+                    device_map=args.device_map,
+                    dtype=args.dtype,
+                    quantization=args.quantization,
+                )
+            )
+
+        print(
+            f"Model loaded: {model_name_or_path} (backend={args.llm_backend}, quantization={args.quantization})"
         )
 
-    print(
-        f"Model loaded: {model_name_or_path} (backend={args.llm_backend}, quantization={args.quantization})"
-    )
+        error_budget = 1
 
-    error_budget = 1
+        prev_results_path = output_path
+        results = []
+        convs = []
+        answered_ids = set()
 
-    prev_results_path = output_path
-    results = []
-    convs = []
-    answered_ids = set()
+        print('Split:', split)
+        print('Input JSON:', json_path)
+        print('Image dir:', image_dir)
+        print('Saving results to:', output_path)
+        print('Saving conversations to:', convs_output_path)
 
-    print('Split:', split)
-    print('Input JSON:', json_path)
-    print('Image dir:', image_dir)
-    print('Saving results to:', output_path)
-    print('Saving conversations to:', convs_output_path)
+        if prev_results_path and os.path.exists(prev_results_path):
+            with open(prev_results_path, 'r') as f:
+                prev_results = json.load(f)
+                results = [item for item in prev_results if item['normalized_answer'] != "-1"]
+            if os.path.exists(convs_output_path):
+                with open(convs_output_path, 'r') as f:
+                    prev_convs = json.load(f)
+                    convs = [item for item in prev_convs if item['normalized_answer'] != "-1"]
+            answered_ids = {item['id'] for item in results}
+            print(f"Loaded {len(results)} previous results.")
 
-    if prev_results_path and os.path.exists(prev_results_path):
-        with open(prev_results_path, 'r') as f:
-            prev_results = json.load(f)
-            results = [item for item in prev_results if item['normalized_answer'] != "-1"]
-        if os.path.exists(convs_output_path):
-            with open(convs_output_path, 'r') as f:
-                prev_convs = json.load(f)
-                convs = [item for item in prev_convs if item['normalized_answer'] != "-1"]
-        answered_ids = {item['id'] for item in results}
-        print(f"Loaded {len(results)} previous results.")
+        tools = tools_api(dist_model_cfg={'model_path': os.path.join(REPO_ROOT, 'distance_est', 'ckpt', 'epoch_5_iter_6831.pth')}, 
+                          inside_model_cfg={'model_path': os.path.join(REPO_ROOT, 'inside_pred', 'ckpt', 'epoch_4.pth')},
+                          small_dist_model_cfg={'model_path': os.path.join(REPO_ROOT, 'distance_est', 'ckpt', '3m_epoch6.pth')},
+                          resize=(360, 640),
+                          mask_IoU_thres=0.3, inside_thres=0.5,
+                          cascade_dist_thres=300, clamp_distance_thres=25)
 
-    tools = tools_api(dist_model_cfg={'model_path': os.path.join(REPO_ROOT, 'distance_est', 'ckpt', 'epoch_5_iter_6831.pth')}, 
-                      inside_model_cfg={'model_path': os.path.join(REPO_ROOT, 'inside_pred', 'ckpt', 'epoch_4.pth')},
-                      small_dist_model_cfg={'model_path': os.path.join(REPO_ROOT, 'distance_est', 'ckpt', '3m_epoch6.pth')},
-                      resize=(360, 640),
-                      mask_IoU_thres=0.3, inside_thres=0.5,
-                      cascade_dist_thres=300, clamp_distance_thres=25)
-
-    with open(json_path, 'r') as f:
-        data = json.load(f)
-    
-    for idx, item in tqdm(enumerate(data), total=len(data)):
-        id = item['id']
-        if id in answered_ids:
-            continue
-            
-        agent = Agent(
-            llm,
-            tools,
-            item,
-            image_dir=image_dir,
-            max_new_tokens=args.max_new_tokens,
-            do_sample=args.do_sample,
-            temperature=args.temperature,
-            top_p=args.top_p,
-            top_k=args.top_k,
-        )
-        agent.set_masks()
+        with open(json_path, 'r') as f:
+            data = json.load(f)
         
-        attempt = 0
-        while attempt < error_budget:
-            try:
-                answer = agent.set_question()
-                answer = agent.format_answer()
-
-                if isinstance(answer, str) and answer.lower() in ['yes', 'no', 'true', 'false']:
-                    print(f"Invalid answer format: {answer}.")
-                    answer = "-1"
+        for idx, item in tqdm(enumerate(data), total=len(data)):
+            id = item['id']
+            if id in answered_ids:
+                continue
                 
-                results.append({
-                    'id': id,
-                    'normalized_answer': str(answer)
-                })
-                convs.append({
-                    'id': id,
-                    'normalized_answer': str(answer),
-                    'conversation': agent.messages
-                })
+            agent = Agent(
+                llm,
+                tools,
+                item,
+                image_dir=image_dir,
+                max_new_tokens=args.max_new_tokens,
+                do_sample=args.do_sample,
+                temperature=args.temperature,
+                top_p=args.top_p,
+                top_k=args.top_k,
+            )
+            agent.set_masks()
+            
+            attempt = 0
+            while attempt < error_budget:
+                try:
+                    answer = agent.set_question()
+                    answer = agent.format_answer()
 
-                break
-            except Exception as e:
-                attempt += 1
-                print(f"Error processing item {id} (attempt {attempt}/{error_budget}): {e}")
-                if attempt == error_budget:
+                    if isinstance(answer, str) and answer.lower() in ['yes', 'no', 'true', 'false']:
+                        print(f"Invalid answer format: {answer}.")
+                        answer = "-1"
+                    
                     results.append({
                         'id': id,
-                        'normalized_answer': "-1"
+                        'normalized_answer': str(answer)
                     })
                     convs.append({
-                    'id': id,
-                    'normalized_answer': "-1",
-                    'conversation': agent.messages
+                        'id': id,
+                        'normalized_answer': str(answer),
+                        'conversation': agent.messages
                     })
-    
+
+                    break
+                except Exception as e:
+                    attempt += 1
+                    print(f"Error processing item {id} (attempt {attempt}/{error_budget}): {e}")
+                    if attempt == error_budget:
+                        results.append({
+                            'id': id,
+                            'normalized_answer': "-1"
+                        })
+                        convs.append({
+                        'id': id,
+                        'normalized_answer': "-1",
+                        'conversation': agent.messages
+                        })
         
-        with open(output_path, 'w') as f:
-            json.dump(results, f, indent=4)
-        
-        with open(convs_output_path, 'w') as f:
-            json.dump(convs, f, indent=4)
+            
+            with open(output_path, 'w') as f:
+                json.dump(results, f, indent=4)
+            
+            with open(convs_output_path, 'w') as f:
+                json.dump(convs, f, indent=4)
+    finally:
+        _shutdown_llm(llm)
+        _destroy_process_group()
