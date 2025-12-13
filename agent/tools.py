@@ -1,13 +1,11 @@
 import os
 import sys
-from mask import Mask
 import torch
 import numpy as np
 from PIL import Image
 from torchvision.transforms import functional as F
-from typing import List
-import json
-from mask import Mask, parse_masks_from_conversation
+from typing import Dict, List, Tuple
+from mask import Mask
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from distance_est.model import build_dist_model
 from inside_pred.model import build_inside_model
@@ -26,13 +24,44 @@ class tools_api:
         self.clamp_distance_thres = clamp_distance_thres
         self.img_path = img_path
         self.masks = None
+        self._rgb_tensor = None
+        self._resized_mask_cache: Dict[Tuple[int, Tuple[int, int]], np.ndarray] = {}
     
-    def update_masks(self, masks: List[Mask]):
+    def update_masks(self, masks: Dict[str, Mask]):
         self.masks = masks
+        self._resized_mask_cache.clear()
 
     def update_image(self, img_path):
+        img_path = os.fspath(img_path)
+        if img_path == self.img_path and self._rgb_tensor is not None:
+            return
         self.img_path = img_path
         assert os.path.exists(self.img_path), f"Image path {self.img_path} does not exist."
+        self._rgb_tensor = None
+        self._get_rgb_tensor()
+
+    def _get_rgb_tensor(self) -> torch.Tensor:
+        if self._rgb_tensor is None:
+            if self.img_path is None:
+                raise ValueError("Image path is not set. Call update_image(img_path) first.")
+            rgb = Image.open(self.img_path).convert('RGB')
+            rgb = F.resize(rgb, self.resize)
+            rgb = np.asarray(rgb, dtype=np.float32) / 255.0
+            self._rgb_tensor = torch.from_numpy(rgb).permute(2, 0, 1).to(DEVICE)
+        return self._rgb_tensor
+
+    def _get_resized_mask(self, mask: Mask) -> np.ndarray:
+        key = (id(mask), self.resize)
+        cached = self._resized_mask_cache.get(key)
+        if cached is not None:
+            return cached
+
+        mask_array = mask.decode_mask()
+        mask_img = Image.fromarray(mask_array.astype(np.uint8))
+        mask_img = F.resize(mask_img, self.resize, interpolation=Image.NEAREST)
+        resized = np.asarray(mask_img, dtype=np.float32)
+        self._resized_mask_cache[key] = resized
+        return resized
 
     def dist(self, mask_1: Mask, mask_2: Mask) -> float:
 
@@ -42,24 +71,16 @@ class tools_api:
         if mask_2.object_class.lower() == 'buffer' and self.inside(mask_2, [mask_1]):
             return 0.0
 
-        rgb = Image.open(self.img_path).convert('RGB')
-        rgb = F.resize(rgb, self.resize)
-        rgb = np.array(rgb).astype(np.float32) / 255.0
+        rgb = self._get_rgb_tensor()
 
         # Decode and resize masks
-        mask1_array = mask_1.decode_mask()
-        mask2_array = mask_2.decode_mask()
-        mask1_img = Image.fromarray(mask1_array)
-        mask2_img = Image.fromarray(mask2_array)
-        mask1_img = F.resize(mask1_img, self.resize, interpolation=Image.NEAREST)
-        mask2_img = F.resize(mask2_img, self.resize, interpolation=Image.NEAREST)
-        mask1_resized = np.array(mask1_img).astype(np.float32)
-        mask2_resized = np.array(mask2_img).astype(np.float32)
+        mask1_resized = self._get_resized_mask(mask_1)
+        mask2_resized = self._get_resized_mask(mask_2)
+        mask1_tensor = torch.from_numpy(mask1_resized).to(rgb.device).unsqueeze(0)
+        mask2_tensor = torch.from_numpy(mask2_resized).to(rgb.device).unsqueeze(0)
 
-        # Stack inputs
-        components = [rgb, mask1_resized[..., None], mask2_resized[..., None]]
-        input_tensor = np.concatenate(components, axis=-1)  # H x W x C
-        input_tensor = torch.tensor(input_tensor).permute(2, 0, 1).unsqueeze(0).to(DEVICE)  # 1 x C x H x W
+        # Stack inputs: 1 x C x H x W
+        input_tensor = torch.cat([rgb, mask1_tensor, mask2_tensor], dim=0).unsqueeze(0)
 
         with torch.no_grad():
             predicted_distance = self.model(input_tensor).item()
@@ -83,31 +104,21 @@ class tools_api:
         return (np.mean(x_indices), np.mean(y_indices))
 
     def closest(self, mask_A: Mask, masks: List[Mask]) -> str:
-        rgb = Image.open(self.img_path).convert('RGB')
-        rgb = F.resize(rgb, self.resize)
-        rgb = np.array(rgb).astype(np.float32) / 255.0
+        if not masks:
+            raise ValueError("No masks provided to find the closest mask.")
+        rgb = self._get_rgb_tensor()
 
         # Decode and resize mask_A
-        maskA_array = mask_A.decode_mask()
-        maskA_img = Image.fromarray(maskA_array)
-        maskA_img = F.resize(maskA_img, self.resize, interpolation=Image.NEAREST)
-        maskA_resized = np.array(maskA_img).astype(np.float32)
+        maskA_resized = self._get_resized_mask(mask_A)
+        maskA_tensor = torch.from_numpy(maskA_resized).to(rgb.device).unsqueeze(0)
 
-        # Prepare the batch
-        batch_tensors = []
-        for m in masks:
-            maskB_array = m.decode_mask()
-            maskB_img = Image.fromarray(maskB_array)
-            maskB_img = F.resize(maskB_img, self.resize, interpolation=Image.NEAREST)
-            maskB_resized = np.array(maskB_img).astype(np.float32)
-
-            # Stack inputs
-            components = [rgb, maskA_resized[..., None], maskB_resized[..., None]]
-            input_tensor = np.concatenate(components, axis=-1)  # H x W x C
-            input_tensor = torch.tensor(input_tensor).permute(2, 0, 1)  # C x H x W
-            batch_tensors.append(input_tensor)
-
-        batch_tensor = torch.stack(batch_tensors).to(DEVICE)  # N x C x H x W
+        base = torch.cat([rgb, maskA_tensor], dim=0)  # 4 x H x W
+        base_batch = base.unsqueeze(0).expand(len(masks), -1, -1, -1)  # N x 4 x H x W
+        maskB_batch = torch.stack(
+            [torch.from_numpy(self._get_resized_mask(m)) for m in masks],
+            dim=0,
+        ).to(rgb.device).unsqueeze(1)  # N x 1 x H x W
+        batch_tensor = torch.cat([base_batch, maskB_batch], dim=1)  # N x 5 x H x W
 
         # Model inference
         with torch.no_grad():
@@ -138,31 +149,21 @@ class tools_api:
         return iou
 
     def inside(self, mask_A: Mask, masks: List[Mask]) -> int:
-        rgb = Image.open(self.img_path).convert('RGB')
-        rgb = F.resize(rgb, self.resize)
-        rgb = np.array(rgb).astype(np.float32) / 255.0
+        if not masks:
+            return 0
+        rgb = self._get_rgb_tensor()
 
         # Decode and resize mask_A
-        maskA_array = mask_A.decode_mask()
-        maskA_img = Image.fromarray(maskA_array)
-        maskA_img = F.resize(maskA_img, self.resize, interpolation=Image.NEAREST)
-        maskA_resized = np.array(maskA_img).astype(np.float32)
+        maskA_resized = self._get_resized_mask(mask_A)
+        maskA_tensor = torch.from_numpy(maskA_resized).to(rgb.device).unsqueeze(0)
 
-        batch_tensors = []
-
-        for m in masks:
-            maskB_array = m.decode_mask()
-            maskB_img = Image.fromarray(maskB_array)
-            maskB_img = F.resize(maskB_img, self.resize, interpolation=Image.NEAREST)
-            maskB_resized = np.array(maskB_img).astype(np.float32)
-
-            # Stack RGB, maskA, maskB as channels (adapt as needed)
-            components = [rgb, maskA_resized[..., None], maskB_resized[..., None]]
-            input_tensor = np.concatenate(components, axis=-1)
-            input_tensor = torch.tensor(input_tensor).permute(2, 0, 1)
-            batch_tensors.append(input_tensor)
-
-        batch_tensor = torch.stack(batch_tensors).to(DEVICE)
+        base = torch.cat([rgb, maskA_tensor], dim=0)  # 4 x H x W
+        base_batch = base.unsqueeze(0).expand(len(masks), -1, -1, -1)  # N x 4 x H x W
+        maskB_batch = torch.stack(
+            [torch.from_numpy(self._get_resized_mask(m)) for m in masks],
+            dim=0,
+        ).to(rgb.device).unsqueeze(1)  # N x 1 x H x W
+        batch_tensor = torch.cat([base_batch, maskB_batch], dim=1)  # N x 5 x H x W
 
         with torch.no_grad():
             # Output: logits, convert to 0/1 using torch.round on sigmoid

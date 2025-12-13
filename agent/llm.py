@@ -6,6 +6,13 @@ from typing import Any, Mapping, Optional, Sequence
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
+try:
+    from vllm import LLM as VLLMEngine
+    from vllm import SamplingParams as VLLMSamplingParams
+except Exception:  # pragma: no cover
+    VLLMEngine = None
+    VLLMSamplingParams = None
+
 
 @dataclass(frozen=True)
 class HFLLMConfig:
@@ -16,6 +23,18 @@ class HFLLMConfig:
     device_map: Optional[Any] = None
     dtype: str = "auto"
     quantization: str = "none"
+
+
+@dataclass(frozen=True)
+class VLLMConfig:
+    model_name_or_path: str
+    tokenizer_name_or_path: Optional[str] = None
+    revision: Optional[str] = None
+    trust_remote_code: bool = False
+    dtype: str = "auto"
+    tensor_parallel_size: int = 1
+    gpu_memory_utilization: float = 0.9
+    max_model_len: Optional[int] = None
 
 
 def _parse_torch_dtype(dtype: str):
@@ -136,6 +155,75 @@ class HFChatLLM:
         return self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
 
 
+def _to_vllm_dtype(dtype: str) -> str:
+    dtype_norm = (dtype or "auto").strip().lower()
+    if dtype_norm == "auto":
+        return "auto"
+    if dtype_norm in {"fp16", "float16", "half"}:
+        return "half"
+    if dtype_norm in {"bf16", "bfloat16"}:
+        return "bfloat16"
+    if dtype_norm in {"fp32", "float32"}:
+        return "float32"
+    raise ValueError(f"Unsupported vLLM dtype: {dtype!r}. Use one of: auto, fp16, bf16, fp32.")
+
+
+class VLLMChatLLM:
+    def __init__(self, llm, tokenizer):
+        self.llm = llm
+        self.tokenizer = tokenizer
+
+    def build_prompt(self, messages: Sequence[Mapping[str, str]]) -> str:
+        apply_chat_template = getattr(self.tokenizer, "apply_chat_template", None)
+        if callable(apply_chat_template):
+            try:
+                return apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+            except Exception:
+                pass
+        return _fallback_chat_prompt(messages)
+
+    def generate(
+        self,
+        messages: Sequence[Mapping[str, str]],
+        *,
+        max_new_tokens: int = 512,
+        do_sample: bool = False,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        top_k: Optional[int] = None,
+    ) -> str:
+        prompt = self.build_prompt(messages)
+
+        if VLLMSamplingParams is None:
+            raise ImportError(
+                "vLLM is not installed. Install it (e.g. `pip install vllm`) or use --llm_backend hf."
+            )
+
+        sampling_kwargs: dict[str, Any] = {"max_tokens": int(max_new_tokens)}
+        if do_sample:
+            if temperature is not None:
+                sampling_kwargs["temperature"] = float(temperature)
+            if top_p is not None:
+                sampling_kwargs["top_p"] = float(top_p)
+            if top_k is not None:
+                sampling_kwargs["top_k"] = int(top_k)
+        else:
+            sampling_kwargs["temperature"] = 0.0
+
+        if self.tokenizer.eos_token_id is not None:
+            sampling_kwargs["stop_token_ids"] = [int(self.tokenizer.eos_token_id)]
+
+        sampling_params = VLLMSamplingParams(**sampling_kwargs)
+        outputs = self.llm.generate([prompt], sampling_params, use_tqdm=False)
+        if not outputs or not getattr(outputs[0], "outputs", None):
+            return ""
+        return outputs[0].outputs[0].text
+
+
 def load_hf_chat_llm(config: HFLLMConfig) -> HFChatLLM:
     tokenizer_path = config.tokenizer_name_or_path or config.model_name_or_path
     tokenizer = AutoTokenizer.from_pretrained(
@@ -178,3 +266,34 @@ def load_hf_chat_llm(config: HFLLMConfig) -> HFChatLLM:
     if getattr(model.config, "pad_token_id", None) is None and tokenizer.pad_token_id is not None:
         model.config.pad_token_id = tokenizer.pad_token_id
     return HFChatLLM(model=model, tokenizer=tokenizer)
+
+
+def load_vllm_chat_llm(config: VLLMConfig) -> VLLMChatLLM:
+    if VLLMEngine is None:
+        raise ImportError(
+            "vLLM is not installed. Install it (e.g. `pip install vllm`) or use --llm_backend hf."
+        )
+
+    tokenizer_path = config.tokenizer_name_or_path or config.model_name_or_path
+    tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer_path,
+        revision=config.revision,
+        trust_remote_code=config.trust_remote_code,
+    )
+    if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    llm_kwargs: dict[str, Any] = {
+        "model": config.model_name_or_path,
+        "tokenizer": tokenizer_path,
+        "trust_remote_code": config.trust_remote_code,
+        "dtype": _to_vllm_dtype(config.dtype),
+        "tensor_parallel_size": int(config.tensor_parallel_size),
+        "gpu_memory_utilization": float(config.gpu_memory_utilization),
+        "revision": config.revision,
+        "max_model_len": config.max_model_len,
+    }
+    llm_kwargs = {key: value for key, value in llm_kwargs.items() if value is not None}
+
+    llm = VLLMEngine(**llm_kwargs)
+    return VLLMChatLLM(llm=llm, tokenizer=tokenizer)

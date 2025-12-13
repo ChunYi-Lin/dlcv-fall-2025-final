@@ -9,9 +9,9 @@ from mask import parse_masks_from_conversation
 import torch
 
 try:
-    from llm import HFLLMConfig, load_hf_chat_llm
+    from llm import HFLLMConfig, VLLMConfig, load_hf_chat_llm, load_vllm_chat_llm
 except ImportError:
-    from agent.llm import HFLLMConfig, load_hf_chat_llm
+    from agent.llm import HFLLMConfig, VLLMConfig, load_hf_chat_llm, load_vllm_chat_llm
 
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.abspath(os.path.join(THIS_DIR, os.pardir))
@@ -61,6 +61,31 @@ def parse_args():
         type=str,
         default='auto',
         help='Model dtype: auto, fp16, bf16, fp32',
+    )
+    parser.add_argument(
+        '--llm_backend',
+        type=str,
+        default='hf',
+        choices=['hf', 'vllm'],
+        help='LLM backend: hf (transformers) or vllm',
+    )
+    parser.add_argument(
+        '--vllm_tensor_parallel_size',
+        type=int,
+        default=1,
+        help='vLLM tensor parallel size (only for --llm_backend vllm)',
+    )
+    parser.add_argument(
+        '--vllm_gpu_memory_utilization',
+        type=float,
+        default=0.9,
+        help='vLLM GPU memory utilization (only for --llm_backend vllm)',
+    )
+    parser.add_argument(
+        '--vllm_max_model_len',
+        type=int,
+        default=None,
+        help='vLLM max model length (only for --llm_backend vllm)',
     )
     parser.add_argument('--max_new_tokens', type=int, default=512, help='Max new tokens per turn')
     parser.add_argument('--do_sample', action='store_true', help='Enable sampling for generation')
@@ -280,19 +305,37 @@ if __name__ == "__main__":
     default_model_path = os.path.join(REPO_ROOT, "Qwen2.5-7B-Instruct")
     model_name_or_path = args.model or default_model_path
 
-    llm = load_hf_chat_llm(
-        HFLLMConfig(
-            model_name_or_path=model_name_or_path,
-            tokenizer_name_or_path=args.tokenizer,
-            revision=args.revision,
-            trust_remote_code=args.trust_remote_code,
-            device_map=args.device_map,
-            dtype=args.dtype,
-            quantization=args.quantization,
+    if args.llm_backend == 'vllm':
+        if (args.quantization or 'none').strip().lower() != 'none':
+            raise ValueError("vLLM backend currently requires --quantization none.")
+        llm = load_vllm_chat_llm(
+            VLLMConfig(
+                model_name_or_path=model_name_or_path,
+                tokenizer_name_or_path=args.tokenizer,
+                revision=args.revision,
+                trust_remote_code=args.trust_remote_code,
+                dtype=args.dtype,
+                tensor_parallel_size=args.vllm_tensor_parallel_size,
+                gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+                max_model_len=args.vllm_max_model_len,
+            )
         )
-    )
+    else:
+        llm = load_hf_chat_llm(
+            HFLLMConfig(
+                model_name_or_path=model_name_or_path,
+                tokenizer_name_or_path=args.tokenizer,
+                revision=args.revision,
+                trust_remote_code=args.trust_remote_code,
+                device_map=args.device_map,
+                dtype=args.dtype,
+                quantization=args.quantization,
+            )
+        )
 
-    print(f"Model loaded: {model_name_or_path} (quantization={args.quantization})")
+    print(
+        f"Model loaded: {model_name_or_path} (backend={args.llm_backend}, quantization={args.quantization})"
+    )
 
     error_budget = 1
 

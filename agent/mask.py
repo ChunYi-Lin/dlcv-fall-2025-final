@@ -21,7 +21,9 @@ class Mask:
         return f"region_{self.region_id}"
     
     def decode_mask(self):
-        return mask_utils.decode(self.rle).astype(np.float32)
+        if self.loaded is None:
+            self.loaded = mask_utils.decode(self.rle).astype(np.float32)
+        return self.loaded
 
     def __repr__(self):
         return (f"Mask(object_class='{self.object_class}', "
