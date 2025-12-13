@@ -141,8 +141,13 @@ class Agent:
             raise ValueError("No valid masks found in the conversation.")
     
     def format_answer(self):
-        # Simply call generate with the answer preamble
-        return self.generate_response(self.answer_preamble)
+        answer = self.generate_response(self.answer_preamble)
+        answer = answer.strip()
+
+        if answer in self.masks:
+            return self.masks[answer].region_id
+        else:
+            return answer
 
     def set_question(self):
         self.messages = [] # Reset history
