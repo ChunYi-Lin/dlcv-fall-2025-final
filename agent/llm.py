@@ -88,6 +88,31 @@ def _fallback_chat_prompt(messages: Sequence[Mapping[str, str]]) -> str:
     return "\n".join(lines)
 
 
+def _ensure_transformers_activation_compat() -> None:
+    """
+    Keep compatibility with external quantization libraries (e.g. AutoAWQ)
+    that import activation helpers which may be removed from newer
+    transformers releases.
+    """
+
+    try:
+        import transformers.activations as activations
+    except Exception:
+        return
+
+    if hasattr(activations, "PytorchGELUTanh"):
+        return
+
+    class PytorchGELUTanh(torch.nn.Module):  # type: ignore[name-defined]
+        def forward(self, input):  # noqa: A002
+            try:
+                return torch.nn.functional.gelu(input, approximate="tanh")
+            except TypeError:
+                return torch.nn.functional.gelu(input)
+
+    activations.PytorchGELUTanh = PytorchGELUTanh  # type: ignore[attr-defined]
+
+
 class HFChatLLM:
     def __init__(self, model, tokenizer):
         self.model = model
@@ -262,6 +287,7 @@ def load_hf_chat_llm(config: HFLLMConfig) -> HFChatLLM:
             f"Unsupported quantization: {config.quantization!r}. Use one of: none, 4bit, 8bit."
         )
 
+    _ensure_transformers_activation_compat()
     model = AutoModelForCausalLM.from_pretrained(config.model_name_or_path, **model_kwargs)
     if getattr(model.config, "pad_token_id", None) is None and tokenizer.pad_token_id is not None:
         model.config.pad_token_id = tokenizer.pad_token_id
