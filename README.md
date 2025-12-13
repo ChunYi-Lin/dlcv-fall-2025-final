@@ -70,6 +70,13 @@ cd agent
 python agent_run.py --output_path ../output/test.json --quantization none
 ```
 
+You can swap the LLM with any Hugging Face Transformers causal LM (local path or hub id):
+
+```bash
+cd agent
+python agent_run.py --output_path ../output/test.json --model <model_name_or_path> --device_map auto --dtype bf16
+```
+
 Additionally, some QA might failed because Gemini return invalid format or answer, run again with thinking mode enabled can solve this issue. 
 Running this command will re-run those failure cases.
 ```
@@ -124,4 +131,3 @@ If you find this work useful, please cite our ICCV Workshop 2025 paper, thank yo
     pages     = {5224-5228}
 }
 ```
-

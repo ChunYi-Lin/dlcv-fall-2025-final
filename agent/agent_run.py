@@ -7,7 +7,11 @@ from argparse import ArgumentParser
 from tqdm import tqdm
 from mask import parse_masks_from_conversation
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+
+try:
+    from llm import HFLLMConfig, load_hf_chat_llm
+except ImportError:
+    from agent.llm import HFLLMConfig, load_hf_chat_llm
 
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.abspath(os.path.join(THIS_DIR, os.pardir))
@@ -28,12 +32,73 @@ def parse_args():
                         help='Path to save the results (defaults to output/<split>.json)')
     parser.add_argument('--quantization', type=str, default='none', choices=['none', '4bit', '8bit'],
                         help='Quantization mode: none (full precision), 4bit, or 8bit')
+    parser.add_argument(
+        '--model',
+        type=str,
+        default=None,
+        help='HF model name or local path (defaults to <repo>/Qwen2.5-7B-Instruct)',
+    )
+    parser.add_argument(
+        '--tokenizer',
+        type=str,
+        default=None,
+        help='HF tokenizer name or local path (defaults to --model)',
+    )
+    parser.add_argument('--revision', type=str, default=None, help='Model/tokenizer revision')
+    parser.add_argument(
+        '--trust_remote_code',
+        action='store_true',
+        help='Allow custom model code from the Hugging Face Hub',
+    )
+    parser.add_argument(
+        '--device_map',
+        type=str,
+        default=None,
+        help='Device map for transformers (e.g. cuda:0, cpu, auto)',
+    )
+    parser.add_argument(
+        '--dtype',
+        type=str,
+        default='auto',
+        help='Model dtype: auto, fp16, bf16, fp32',
+    )
+    parser.add_argument('--max_new_tokens', type=int, default=512, help='Max new tokens per turn')
+    parser.add_argument('--do_sample', action='store_true', help='Enable sampling for generation')
+    parser.add_argument(
+        '--temperature',
+        type=float,
+        default=None,
+        help='Sampling temperature (requires --do_sample)',
+    )
+    parser.add_argument(
+        '--top_p',
+        type=float,
+        default=None,
+        help='Nucleus sampling p (requires --do_sample)',
+    )
+    parser.add_argument(
+        '--top_k',
+        type=int,
+        default=None,
+        help='Top-k sampling (requires --do_sample)',
+    )
     return parser.parse_args()
 
 class Agent:
-    def __init__(self, model, tokenizer, tools_api, input, image_dir: str):
-        self.model = model          
-        self.tokenizer = tokenizer
+    def __init__(
+        self,
+        llm,
+        tools_api,
+        input,
+        image_dir: str,
+        *,
+        max_new_tokens: int = 512,
+        do_sample: bool = False,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        top_k: int | None = None,
+    ):
+        self.llm = llm
         self.tools_api = tools_api
         self.messages = []
         self.conversation = []
@@ -43,33 +108,25 @@ class Agent:
         self.image_dir = image_dir
         self.masks = None
         self.question = None
+        self.max_new_tokens = max_new_tokens
+        self.do_sample = do_sample
+        self.temperature = temperature
+        self.top_p = top_p
+        self.top_k = top_k
 
     def generate_response(self, new_user_content):
         # Append new user message to history
         self.messages.append({"role": "user", "content": new_user_content})
-        
-        # Format history into a single string
-        text = self.tokenizer.apply_chat_template(
-            self.messages, 
-            tokenize=False, 
-            add_generation_prompt=True
+
+        response_text = self.llm.generate(
+            self.messages,
+            max_new_tokens=self.max_new_tokens,
+            do_sample=self.do_sample,
+            temperature=self.temperature,
+            top_p=self.top_p,
+            top_k=self.top_k,
         )
-        
-        # Tokenize and Generate
-        model_inputs = self.tokenizer([text], return_tensors="pt").to(self.model.device)
-        
-        with torch.no_grad():
-            generated_ids = self.model.generate(
-                **model_inputs,
-                max_new_tokens=512
-            )
-        
-        # Decode ONLY the new response
-        generated_ids = [
-            output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
-        ]
-        response_text = self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
-        
+
         # Append assistant response to history
         self.messages.append({"role": "assistant", "content": response_text})
         
@@ -213,43 +270,24 @@ if __name__ == "__main__":
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
 
-    print("Loading Qwen model...")
-    
-    # POINT TO YOUR LOCAL FOLDER
-    MODEL_PATH = os.path.join(REPO_ROOT, "Qwen2.5-7B-Instruct")
-    
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
-    
-    # Configure quantization
-    if args.quantization == '4bit':
-        quantization_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.float16,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_use_double_quant=True
+    print("Loading LLM...")
+
+    default_model_path = os.path.join(REPO_ROOT, "Qwen2.5-7B-Instruct")
+    model_name_or_path = args.model or default_model_path
+
+    llm = load_hf_chat_llm(
+        HFLLMConfig(
+            model_name_or_path=model_name_or_path,
+            tokenizer_name_or_path=args.tokenizer,
+            revision=args.revision,
+            trust_remote_code=args.trust_remote_code,
+            device_map=args.device_map,
+            dtype=args.dtype,
+            quantization=args.quantization,
         )
-        model = AutoModelForCausalLM.from_pretrained(
-            MODEL_PATH,
-            quantization_config=quantization_config,
-            device_map="cuda:0"
-        )
-    elif args.quantization == '8bit':
-        quantization_config = BitsAndBytesConfig(
-            load_in_8bit=True
-        )
-        model = AutoModelForCausalLM.from_pretrained(
-            MODEL_PATH,
-            quantization_config=quantization_config,
-            device_map="cuda:0"
-        )
-    else:
-        model = AutoModelForCausalLM.from_pretrained(
-            MODEL_PATH,
-            torch_dtype="auto", 
-            device_map="cuda:0"
-        )
-    
-    print(f"Model loaded with quantization: {args.quantization}")
+    )
+
+    print(f"Model loaded: {model_name_or_path} (quantization={args.quantization})")
 
     error_budget = 1
 
@@ -290,7 +328,17 @@ if __name__ == "__main__":
         if id in answered_ids:
             continue
             
-        agent = Agent(model, tokenizer, tools, item, image_dir=image_dir)
+        agent = Agent(
+            llm,
+            tools,
+            item,
+            image_dir=image_dir,
+            max_new_tokens=args.max_new_tokens,
+            do_sample=args.do_sample,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            top_k=args.top_k,
+        )
         agent.set_masks()
         
         attempt = 0

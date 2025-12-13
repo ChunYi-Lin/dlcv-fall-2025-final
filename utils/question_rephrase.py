@@ -1,59 +1,75 @@
 import re
 import json
+import os
+import sys
 from argparse import ArgumentParser
 from tqdm import tqdm
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+
+THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.abspath(os.path.join(THIS_DIR, os.pardir))
+
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+
+from agent.llm import HFLLMConfig, load_hf_chat_llm
 
 def parse_args():
     parser = ArgumentParser(description="Rephrase questions with mask replacement.")
     parser.add_argument('--test', action='store_true', help='Use test set instead of val set')
     parser.add_argument('--quantization', type=str, default='none', choices=['none', '4bit', '8bit'],
                         help='Quantization mode: none (full precision), 4bit, or 8bit')
+    parser.add_argument(
+        '--model',
+        type=str,
+        default=None,
+        help='HF model name or local path (defaults to <repo>/Qwen2.5-7B-Instruct)',
+    )
+    parser.add_argument(
+        '--tokenizer',
+        type=str,
+        default=None,
+        help='HF tokenizer name or local path (defaults to --model)',
+    )
+    parser.add_argument('--revision', type=str, default=None, help='Model/tokenizer revision')
+    parser.add_argument(
+        '--trust_remote_code',
+        action='store_true',
+        help='Allow custom model code from the Hugging Face Hub',
+    )
+    parser.add_argument(
+        '--device_map',
+        type=str,
+        default=None,
+        help='Device map for transformers (e.g. cuda:0, cpu, auto)',
+    )
+    parser.add_argument(
+        '--dtype',
+        type=str,
+        default='auto',
+        help='Model dtype: auto, fp16, bf16, fp32',
+    )
     return parser.parse_args()
 
-def load_model(quantization='none'):
-    MODEL_PATH = "./Qwen2.5-7B-Instruct" 
+def load_model(args):
+    default_model_path = os.path.join(REPO_ROOT, "Qwen2.5-7B-Instruct")
+    model_name_or_path = args.model or default_model_path
+    print(f"Loading model: {model_name_or_path}")
+    return load_hf_chat_llm(
+        HFLLMConfig(
+            model_name_or_path=model_name_or_path,
+            tokenizer_name_or_path=args.tokenizer,
+            revision=args.revision,
+            trust_remote_code=args.trust_remote_code,
+            device_map=args.device_map,
+            dtype=args.dtype,
+            quantization=args.quantization,
+        )
+    )
 
-    print(f"Loading from local path: {MODEL_PATH}")
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
-    
-    if quantization == '4bit':
-        quantization_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.float16,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_use_double_quant=True
-        )
-        model = AutoModelForCausalLM.from_pretrained(
-            MODEL_PATH,
-            quantization_config=quantization_config,
-            device_map="cuda:0"
-        )
-    elif quantization == '8bit':
-        quantization_config = BitsAndBytesConfig(
-            load_in_8bit=True
-        )
-        model = AutoModelForCausalLM.from_pretrained(
-            MODEL_PATH,
-            quantization_config=quantization_config,
-            device_map="cuda:0"
-        )
-    else:
-        model = AutoModelForCausalLM.from_pretrained(
-            MODEL_PATH,
-            torch_dtype="auto",
-            device_map="cuda:0"
-        )
-    
-    print(f"Model loaded with quantization: {quantization}")
-    return model, tokenizer
+# This will be initialized in main
+llm = None
 
-# These will be initialized in main
-model = None
-tokenizer = None
-
-TYPE_PROMPT = open('agent/prompt/rephrase.txt', 'r').read()
+TYPE_PROMPT = open(os.path.join(REPO_ROOT, 'agent', 'prompt', 'rephrase.txt'), 'r').read()
 
 OBJECT_TYPES = ('pallet', 'transporter', 'shelf', 'buffer')
 OBJECT_TYPE_RE = re.compile(r"(pallet|transporter|shelf|buffer)", re.IGNORECASE)
@@ -91,25 +107,11 @@ def predict_object_type(question_with_target_mask: str) -> str:
             {"role": "system", "content": "You are a strict classifier. Reply with a single word."},
             {"role": "user", "content": user_content},
         ]
-
-        text = tokenizer.apply_chat_template(
+        last_response = llm.generate(
             messages,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-
-        model_inputs = tokenizer([text], return_tensors="pt").to(model.device)
-
-        generated_ids = model.generate(
-            **model_inputs,
             max_new_tokens=5,
             do_sample=False,
-        )
-
-        generated_ids = [
-            output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
-        ]
-        last_response = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
+        ).strip()
 
         object_type = _extract_object_type(last_response)
         if object_type in OBJECT_TYPES:
@@ -182,7 +184,7 @@ if __name__ == "__main__":
     args = parse_args()
     
     # Load model with quantization option
-    model, tokenizer = load_model(args.quantization)
+    llm = load_model(args)
 
     if args.test:
         input_path = 'data/test/test.json'
