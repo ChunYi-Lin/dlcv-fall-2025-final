@@ -12,6 +12,7 @@ if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
 from agent.llm import HFLLMConfig, load_hf_chat_llm
+from agent.llm import VLLMConfig, load_vllm_chat_llm
 
 def parse_args():
     parser = ArgumentParser(description="Rephrase questions with mask replacement.")
@@ -48,12 +49,55 @@ def parse_args():
         default='auto',
         help='Model dtype: auto, fp16, bf16, fp32',
     )
+    parser.add_argument(
+        '--llm_backend',
+        type=str,
+        default='hf',
+        choices=['hf', 'vllm'],
+        help='LLM backend: hf (transformers) or vllm',
+    )
+    parser.add_argument(
+        '--vllm_tensor_parallel_size',
+        type=int,
+        default=1,
+        help='vLLM tensor parallel size (only for --llm_backend vllm)',
+    )
+    parser.add_argument(
+        '--vllm_gpu_memory_utilization',
+        type=float,
+        default=0.9,
+        help='vLLM GPU memory utilization (only for --llm_backend vllm)',
+    )
+    parser.add_argument(
+        '--vllm_max_model_len',
+        type=int,
+        default=None,
+        help='vLLM max model length (only for --llm_backend vllm)',
+    )
     return parser.parse_args()
 
 def load_model(args):
     default_model_path = os.path.join(REPO_ROOT, "Qwen2.5-7B-Instruct")
     model_name_or_path = args.model or default_model_path
-    print(f"Loading model: {model_name_or_path}")
+    backend = getattr(args, "llm_backend", "hf")
+    print(f"Loading model: {model_name_or_path} (backend={backend})")
+
+    if backend == "vllm":
+        if (args.quantization or "none").strip().lower() != "none":
+            raise ValueError("vLLM backend currently requires --quantization none.")
+        return load_vllm_chat_llm(
+            VLLMConfig(
+                model_name_or_path=model_name_or_path,
+                tokenizer_name_or_path=args.tokenizer,
+                revision=args.revision,
+                trust_remote_code=args.trust_remote_code,
+                dtype=args.dtype,
+                tensor_parallel_size=args.vllm_tensor_parallel_size,
+                gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+                max_model_len=args.vllm_max_model_len,
+            )
+        )
+
     return load_hf_chat_llm(
         HFLLMConfig(
             model_name_or_path=model_name_or_path,
