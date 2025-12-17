@@ -3,43 +3,159 @@ import json
 import os
 import ast
 from tools import tools_api
-from google import genai
 from argparse import ArgumentParser
 from tqdm import tqdm
 from mask import parse_masks_from_conversation
+import torch
+
+try:
+    from llm import HFLLMConfig, VLLMConfig, load_hf_chat_llm, load_vllm_chat_llm
+except ImportError:
+    from agent.llm import HFLLMConfig, VLLMConfig, load_hf_chat_llm, load_vllm_chat_llm
+
+THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.abspath(os.path.join(THIS_DIR, os.pardir))
+
+def convs_output_path_for(output_path: str) -> str:
+    root, ext = os.path.splitext(output_path)
+    return f"{root}_convs{ext or '.json'}"
 
 def parse_args():
     parser = ArgumentParser(description="Agent for answering questions with inside model.")
-    parser.add_argument('--project_id', type=str, required=True, help='Google Cloud Project ID')
-    parser.add_argument('--location', type=str, default='global', help='Location for the Vertex AI resources')
-    parser.add_argument('--think_mode', action='store_true', help='Enable think mode for the agent')
-    parser.add_argument('--output_path', type=str, default='../output/test.json', help='Path to save the results')
+    parser.add_argument('--split', type=str, default='test', choices=['train', 'val', 'test'],
+                        help='Dataset split to run on')
+    parser.add_argument('--json_path', type=str, default=None,
+                        help='Path to input JSON (defaults to data/<split>/rephrased_<split>.json)')
+    parser.add_argument('--image_dir', type=str, default=None,
+                        help='Image directory (defaults to data/<split>/images)')
+    parser.add_argument('--output_path', type=str, default=None,
+                        help='Path to save the results (defaults to output/<split>.json)')
+    parser.add_argument('--quantization', type=str, default='none', choices=['none', '4bit', '8bit'],
+                        help='Quantization mode: none (full precision), 4bit, or 8bit')
+    parser.add_argument(
+        '--model',
+        type=str,
+        default=None,
+        help='HF model name or local path (defaults to <repo>/Qwen2.5-7B-Instruct)',
+    )
+    parser.add_argument(
+        '--tokenizer',
+        type=str,
+        default=None,
+        help='HF tokenizer name or local path (defaults to --model)',
+    )
+    parser.add_argument('--revision', type=str, default=None, help='Model/tokenizer revision')
+    parser.add_argument(
+        '--trust_remote_code',
+        action='store_true',
+        help='Allow custom model code from the Hugging Face Hub',
+    )
+    parser.add_argument(
+        '--device_map',
+        type=str,
+        default=None,
+        help='Device map for transformers (e.g. cuda:0, cpu, auto)',
+    )
+    parser.add_argument(
+        '--dtype',
+        type=str,
+        default='auto',
+        help='Model dtype: auto, fp16, bf16, fp32',
+    )
+    parser.add_argument(
+        '--llm_backend',
+        type=str,
+        default='hf',
+        choices=['hf', 'vllm'],
+        help='LLM backend: hf (transformers) or vllm',
+    )
+    parser.add_argument(
+        '--vllm_tensor_parallel_size',
+        type=int,
+        default=1,
+        help='vLLM tensor parallel size (only for --llm_backend vllm)',
+    )
+    parser.add_argument(
+        '--vllm_gpu_memory_utilization',
+        type=float,
+        default=0.9,
+        help='vLLM GPU memory utilization (only for --llm_backend vllm)',
+    )
+    parser.add_argument(
+        '--vllm_max_model_len',
+        type=int,
+        default=None,
+        help='vLLM max model length (only for --llm_backend vllm)',
+    )
+    parser.add_argument('--max_new_tokens', type=int, default=512, help='Max new tokens per turn')
+    parser.add_argument('--do_sample', action='store_true', help='Enable sampling for generation')
+    parser.add_argument(
+        '--temperature',
+        type=float,
+        default=None,
+        help='Sampling temperature (requires --do_sample)',
+    )
+    parser.add_argument(
+        '--top_p',
+        type=float,
+        default=None,
+        help='Nucleus sampling p (requires --do_sample)',
+    )
+    parser.add_argument(
+        '--top_k',
+        type=int,
+        default=None,
+        help='Top-k sampling (requires --do_sample)',
+    )
     return parser.parse_args()
 
 class Agent:
-    def __init__(self, project_id, location, tools_api, input, think_mode=False):
+    def __init__(
+        self,
+        llm,
+        tools_api,
+        input,
+        image_dir: str,
+        *,
+        max_new_tokens: int = 512,
+        do_sample: bool = False,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        top_k: int | None = None,
+    ):
+        self.llm = llm
         self.tools_api = tools_api
-        self.client = genai.Client(vertexai=True, project=project_id, location=location)
-        
-        if think_mode:
-            self.chat = self.client.chats.create(
-                model="gemini-2.5-flash-preview-05-20",
-                config=genai.types.GenerateContentConfig(
-                    thinking_config=genai.types.ThinkingConfig(thinking_budget=128), temperature=0.2)
-                )
-        else:
-            self.chat = self.client.chats.create(
-                model="gemini-2.5-flash-preview-05-20",
-                config=genai.types.GenerateContentConfig(temperature=0.2)
-            )
-
         self.messages = []
         self.conversation = []
-        self.prompt_preamble = open('prompt/agent_example.txt', 'r').read()
-        self.answer_preamble = open('prompt/answer.txt', 'r').read()
+        self.prompt_preamble = open(os.path.join(THIS_DIR, 'prompt', 'agent_example.txt'), 'r').read()
+        self.answer_preamble = open(os.path.join(THIS_DIR, 'prompt', 'answer.txt'), 'r').read()
         self.input = input
+        self.image_dir = image_dir
         self.masks = None
         self.question = None
+        self.max_new_tokens = max_new_tokens
+        self.do_sample = do_sample
+        self.temperature = temperature
+        self.top_p = top_p
+        self.top_k = top_k
+
+    def generate_response(self, new_user_content):
+        # Append new user message to history
+        self.messages.append({"role": "user", "content": new_user_content})
+
+        response_text = self.llm.generate(
+            self.messages,
+            max_new_tokens=self.max_new_tokens,
+            do_sample=self.do_sample,
+            temperature=self.temperature,
+            top_p=self.top_p,
+            top_k=self.top_k,
+        )
+
+        # Append assistant response to history
+        self.messages.append({"role": "assistant", "content": response_text})
+        
+        return response_text
 
     def set_masks(self):
         conversation = self.input['rephrase_conversations'][0]['value']
@@ -50,51 +166,58 @@ class Agent:
             raise ValueError("No valid masks found in the conversation.")
     
     def format_answer(self):
-        answer = self.chat.send_message(self.answer_preamble)
-        answer = answer.text.strip()
+        answer = self.generate_response(self.answer_preamble)
+        answer = answer.strip()
+
         if answer in self.masks:
             return self.masks[answer].region_id
         else:
             return answer
 
     def set_question(self):
-        self.messages = []
+        self.messages = [] # Reset history
         self.question = self.input['rephrase_conversations'][0]['value']
         full_prompt = self.prompt_preamble.replace("<question>", self.question)
-        self.messages.append({"role": "user", "content": full_prompt})
-        self.tools_api.update_image('../data/test/images/' + self.input['image'])
-        return self._conversation_loop()
+        self.messages.append({"role": "system", "content": "You are a helpful agent."})
+        self.tools_api.update_image(os.path.join(self.image_dir, self.input['image']))
+        
+        # Call loop passing the initial prompt as the first "trigger"
+        return self._conversation_loop(initial_prompt=full_prompt)
 
-    def _conversation_loop(self, budget=10):
+    def _conversation_loop(self, budget=10, initial_prompt=None):
         usage = 0
         execute_flag = False
+        
+        # Handle the very first message
+        current_input = initial_prompt
+        
         while usage < budget:
             usage += 1
-            # Compose the prompt from the conversation history
-            latest_message = self.messages[-1]["content"]
-            response = self.chat.send_message(latest_message)
-            assistant_text = response.text.strip()
-            self.messages.append({"role": "assistant", "content": assistant_text})
-
-            # Check for <execute> command
+            
+            # Generate
+            assistant_text = self.generate_response(current_input)
+            
+            # Check for <execute>
             execute_match = re.search(r"<execute>(.*?)</execute>", assistant_text, re.DOTALL)
             if execute_match:
                 execute_flag = True
                 command = execute_match.group(1).strip()
-                result = self._execute_function(command)
-                # Send the result back to Gemini
-                self.messages.append({"role": "user", "content": f"{result}"})
-                continue  # Continue the loop
+                try:
+                    result = self._execute_function(command)
+                    # The result becomes the input for the next turn
+                    current_input = f"{result}"
+                except Exception as e:
+                    current_input = f"Error: {str(e)}"
+                continue
 
-            # Check for <answer> tag
+            # Check for <answer>
             answer_match = re.search(r"<answer>(.*?)</answer>", assistant_text, re.DOTALL)
-            if answer_match and execute_flag:
-                final_answer = answer_match.group(1).strip()
-                self.messages.append({"role": "assistant", "content": final_answer})
-                return final_answer
+            if answer_match: # Removed 'and execute_flag' strict check if you want it to be more robust
+                return answer_match.group(1).strip()
 
-            print("No valid action found. Ending interaction.")
-            raise ValueError("No valid action found in the assistant's response.")
+            # If no tags, maybe provide a hint or break
+            print("No valid action found.")
+            break
 
     def _execute_function(self, command):
         """Parses and executes a function call from Gemini."""
@@ -158,10 +281,61 @@ class Agent:
 
 if __name__ == "__main__":
     args = parse_args()
-    PROJECT_ID = args.project_id
-    LOCATION = args.location
-    USE_THINK_MODE = args.think_mode
-    output_path = args.output_path
+    split = args.split
+    output_path = args.output_path or os.path.join(REPO_ROOT, 'output', f'{split}.json')
+    convs_output_path = convs_output_path_for(output_path)
+    json_path = args.json_path or os.path.join(REPO_ROOT, 'data', split, f'rephrased_{split}.json')
+    image_dir = args.image_dir or os.path.join(REPO_ROOT, 'data', split, 'images')
+
+    if not os.path.exists(json_path):
+        raise FileNotFoundError(
+            f"Input JSON not found: {json_path} (pass --json_path to override)"
+        )
+    if not os.path.isdir(image_dir):
+        raise FileNotFoundError(
+            f"Image directory not found: {image_dir} (pass --image_dir to override)"
+        )
+
+    output_dir = os.path.dirname(output_path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
+    print("Loading LLM...")
+
+    default_model_path = os.path.join(REPO_ROOT, "Qwen2.5-7B-Instruct")
+    model_name_or_path = args.model or default_model_path
+
+    if args.llm_backend == 'vllm':
+        if (args.quantization or 'none').strip().lower() != 'none':
+            raise ValueError("vLLM backend currently requires --quantization none.")
+        llm = load_vllm_chat_llm(
+            VLLMConfig(
+                model_name_or_path=model_name_or_path,
+                tokenizer_name_or_path=args.tokenizer,
+                revision=args.revision,
+                trust_remote_code=args.trust_remote_code,
+                dtype=args.dtype,
+                tensor_parallel_size=args.vllm_tensor_parallel_size,
+                gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+                max_model_len=args.vllm_max_model_len,
+            )
+        )
+    else:
+        llm = load_hf_chat_llm(
+            HFLLMConfig(
+                model_name_or_path=model_name_or_path,
+                tokenizer_name_or_path=args.tokenizer,
+                revision=args.revision,
+                trust_remote_code=args.trust_remote_code,
+                device_map=args.device_map,
+                dtype=args.dtype,
+                quantization=args.quantization,
+            )
+        )
+
+    print(
+        f"Model loaded: {model_name_or_path} (backend={args.llm_backend}, quantization={args.quantization})"
+    )
 
     error_budget = 1
 
@@ -170,26 +344,31 @@ if __name__ == "__main__":
     convs = []
     answered_ids = set()
 
+    print('Split:', split)
+    print('Input JSON:', json_path)
+    print('Image dir:', image_dir)
     print('Saving results to:', output_path)
+    print('Saving conversations to:', convs_output_path)
 
     if prev_results_path and os.path.exists(prev_results_path):
         with open(prev_results_path, 'r') as f:
             prev_results = json.load(f)
             results = [item for item in prev_results if item['normalized_answer'] != "-1"]
-        with open(prev_results_path.replace('test', 'test_convs'), 'r') as f:
-            prev_convs = json.load(f)
-            convs = [item for item in prev_convs if item['normalized_answer'] != "-1"]
+        if os.path.exists(convs_output_path):
+            with open(convs_output_path, 'r') as f:
+                prev_convs = json.load(f)
+                convs = [item for item in prev_convs if item['normalized_answer'] != "-1"]
         answered_ids = {item['id'] for item in results}
         print(f"Loaded {len(results)} previous results.")
 
-    tools = tools_api(dist_model_cfg={'model_path': '../distance_est/ckpt/epoch_5_iter_6831.pth'}, 
-                      inside_model_cfg={'model_path': '../inside_pred/ckpt/epoch_4.pth'},
-                      small_dist_model_cfg={'model_path': '../distance_est/ckpt/3m_epoch6.pth'},
+    tools = tools_api(dist_model_cfg={'model_path': os.path.join(REPO_ROOT, 'distance_est', 'ckpt', 'epoch_5_iter_6831.pth')}, 
+                      inside_model_cfg={'model_path': os.path.join(REPO_ROOT, 'inside_pred', 'ckpt', 'epoch_4.pth')},
+                      small_dist_model_cfg={'model_path': os.path.join(REPO_ROOT, 'distance_est', 'ckpt', '3m_epoch6.pth')},
                       resize=(360, 640),
                       mask_IoU_thres=0.3, inside_thres=0.5,
                       cascade_dist_thres=300, clamp_distance_thres=25)
 
-    with open('../data/test/rephrased_test.json', 'r') as f:
+    with open(json_path, 'r') as f:
         data = json.load(f)
     
     for idx, item in tqdm(enumerate(data), total=len(data)):
@@ -197,7 +376,17 @@ if __name__ == "__main__":
         if id in answered_ids:
             continue
             
-        agent = Agent(PROJECT_ID, LOCATION, tools, item, think_mode=USE_THINK_MODE)
+        agent = Agent(
+            llm,
+            tools,
+            item,
+            image_dir=image_dir,
+            max_new_tokens=args.max_new_tokens,
+            do_sample=args.do_sample,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            top_k=args.top_k,
+        )
         agent.set_masks()
         
         attempt = 0
@@ -239,5 +428,5 @@ if __name__ == "__main__":
         with open(output_path, 'w') as f:
             json.dump(results, f, indent=4)
         
-        with open(output_path.replace('test', 'test_convs'), 'w') as f:
+        with open(convs_output_path, 'w') as f:
             json.dump(convs, f, indent=4)
