@@ -77,15 +77,6 @@ cd agent
 python agent_run.py --output_path ../output/test.json --model <model_name_or_path> --device_map auto --dtype bf16
 ```
 
-Additionally, some QA might failed because Gemini return invalid format or answer, run again with thinking mode enabled can solve this issue. 
-Running this command will re-run those failure cases.
-```
-
-cd agent
-python agent_run.py --project_id <your Vertex AI API> --think_mode
-
-```
-
 ## ⚒️ QA Data Pre-processing and Model Training (Optional)
 
 ### 0. QA Data Pre-processing
