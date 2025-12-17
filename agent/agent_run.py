@@ -361,12 +361,22 @@ if __name__ == "__main__":
         answered_ids = {item['id'] for item in results}
         print(f"Loaded {len(results)} previous results.")
 
-    tools = tools_api(dist_model_cfg={'model_path': os.path.join(REPO_ROOT, 'distance_est', 'ckpt', 'epoch_5_iter_6831.pth')}, 
-                      inside_model_cfg={'model_path': os.path.join(REPO_ROOT, 'inside_pred', 'ckpt', 'epoch_4.pth')},
-                      small_dist_model_cfg={'model_path': os.path.join(REPO_ROOT, 'distance_est', 'ckpt', '3m_epoch6.pth')},
-                      resize=(360, 640),
-                      mask_IoU_thres=0.3, inside_thres=0.5,
-                      cascade_dist_thres=300, clamp_distance_thres=25)
+    tools = tools_api(
+        dist_model_cfg={
+            'arch': 'siamese_geo',
+            'model_path': os.path.join(REPO_ROOT, 'distance_est', 'ckpt', 'siamese_best_loss_model.pth'),
+        },
+        inside_model_cfg={
+            'model_path': os.path.join(REPO_ROOT, 'inside_pred', 'ckpt', 'pred_inside_best.pth'),
+            'resnet_weights': None,
+        },
+        small_dist_model_cfg=None,
+        resize=(360, 640),
+        mask_IoU_thres=0.3,
+        inside_thres=0.5,
+        cascade_dist_thres=3.0,
+        clamp_distance_thres=0.25,
+    )
 
     with open(json_path, 'r') as f:
         data = json.load(f)
