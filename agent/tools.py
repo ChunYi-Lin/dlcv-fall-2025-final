@@ -274,17 +274,18 @@ class tools_api:
             return 0
         rgb = self._get_rgb_tensor()
 
-        # Decode and resize mask_A
-        maskA_resized = self._get_resized_mask(mask_A)
-        maskA_tensor = torch.from_numpy(maskA_resized).to(rgb.device).unsqueeze(0)
+        # Inside model expects [RGB(3) + obj_mask(1) + container_mask(1)].
+        container_resized = self._get_resized_mask(mask_A)
+        container_tensor = torch.from_numpy(container_resized).to(rgb.device).unsqueeze(0)  # 1 x H x W
 
-        base = torch.cat([rgb, maskA_tensor], dim=0)  # 4 x H x W
-        base_batch = base.unsqueeze(0).expand(len(masks), -1, -1, -1)  # N x 4 x H x W
-        maskB_batch = torch.stack(
+        obj_batch = torch.stack(
             [torch.from_numpy(self._get_resized_mask(m)) for m in masks],
             dim=0,
         ).to(rgb.device).unsqueeze(1)  # N x 1 x H x W
-        batch_tensor = torch.cat([base_batch, maskB_batch], dim=1)  # N x 5 x H x W
+
+        rgb_batch = rgb.unsqueeze(0).repeat(len(masks), 1, 1, 1)  # N x 3 x H x W
+        container_batch = container_tensor.unsqueeze(0).repeat(len(masks), 1, 1, 1)  # N x 1 x H x W
+        batch_tensor = torch.cat([rgb_batch, obj_batch, container_batch], dim=1)  # N x 5 x H x W
 
         with torch.no_grad():
             # Output: logits, convert to 0/1 using torch.round on sigmoid
