@@ -104,9 +104,11 @@ class tools_api:
             return cached
 
         mask_array = mask.decode_mask()
-        mask_img = Image.fromarray(mask_array.astype(np.uint8))
-        mask_img = F.resize(mask_img, self.resize, interpolation=Image.NEAREST)
-        resized = np.asarray(mask_img, dtype=np.float32)
+        # Match `DLCV_Final_Project/SpatialAgent/inside_pred/data_loader.py` preprocessing:
+        # (mask * 255) uint8 -> resize(BILINEAR) -> ToTensor (== /255.0).
+        mask_img = Image.fromarray((mask_array * 255).astype(np.uint8))
+        mask_img = F.resize(mask_img, self.resize, interpolation=Image.BILINEAR)
+        resized = np.asarray(mask_img, dtype=np.float32) / 255.0
         self._resized_mask_cache[key] = resized
         return resized
 
@@ -274,7 +276,7 @@ class tools_api:
             return 0
         rgb = self._get_rgb_tensor()
 
-        # Inside model expects [RGB(3) + obj_mask(1) + container_mask(1)].
+        # Inside model was trained with [RGB(3) + container_mask(1) + obj_mask(1)].
         container_resized = self._get_resized_mask(mask_A)
         container_tensor = torch.from_numpy(container_resized).to(rgb.device).unsqueeze(0)  # 1 x H x W
 
@@ -285,7 +287,7 @@ class tools_api:
 
         rgb_batch = rgb.unsqueeze(0).repeat(len(masks), 1, 1, 1)  # N x 3 x H x W
         container_batch = container_tensor.unsqueeze(0).repeat(len(masks), 1, 1, 1)  # N x 1 x H x W
-        batch_tensor = torch.cat([rgb_batch, obj_batch, container_batch], dim=1)  # N x 5 x H x W
+        batch_tensor = torch.cat([rgb_batch, container_batch, obj_batch], dim=1)  # N x 5 x H x W
 
         with torch.no_grad():
             # Output: logits, convert to 0/1 using torch.round on sigmoid
