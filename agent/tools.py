@@ -11,20 +11,21 @@ from distance_est.model import build_dist_model
 from inside_pred.model import build_inside_model
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
+IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
 
 class tools_api:
-    def __init__(self, dist_model_cfg, inside_model_cfg, small_dist_model_cfg, resize=(360,640), mask_IoU_thres=0.3, inside_thres=0.5, cascade_dist_thres=300, clamp_distance_thres=25, img_path=None):
+    def __init__(self, dist_model_cfg, inside_model_cfg, resize=(360, 640), mask_IoU_thres=0.3, inside_thres=0.5, img_path=None):
         self.model = build_dist_model(dist_model_cfg)
         self.inside_model = build_inside_model(inside_model_cfg)
-        self.small_dist_model = build_dist_model(small_dist_model_cfg)
         self.resize = resize
         self.mask_IoU_thres = mask_IoU_thres
         self.inside_thres = inside_thres
-        self.cascade_dist_thres = cascade_dist_thres
-        self.clamp_distance_thres = clamp_distance_thres
         self.img_path = img_path
         self.masks = None
         self._rgb_tensor = None
+        self._rgb_pil = None
+        self._depth_pil = None
         self._resized_mask_cache: Dict[Tuple[int, Tuple[int, int]], np.ndarray] = {}
     
     def update_masks(self, masks: Dict[str, Mask]):
@@ -33,20 +34,47 @@ class tools_api:
 
     def update_image(self, img_path):
         img_path = os.fspath(img_path)
-        if img_path == self.img_path and self._rgb_tensor is not None:
+        if img_path == self.img_path and self._rgb_pil is not None:
             return
         self.img_path = img_path
         assert os.path.exists(self.img_path), f"Image path {self.img_path} does not exist."
         self._rgb_tensor = None
-        self._get_rgb_tensor()
+        self._rgb_pil = None
+        self._depth_pil = None
 
-    def _get_rgb_tensor(self) -> torch.Tensor:
-        if self._rgb_tensor is None:
+    def _get_rgb_pil(self) -> Image.Image:
+        if self._rgb_pil is None:
             if self.img_path is None:
                 raise ValueError("Image path is not set. Call update_image(img_path) first.")
             rgb = Image.open(self.img_path).convert('RGB')
             rgb = F.resize(rgb, self.resize)
-            rgb = np.asarray(rgb, dtype=np.float32) / 255.0
+            self._rgb_pil = rgb
+        return self._rgb_pil
+
+    def _get_depth_pil(self) -> Image.Image:
+        if self._depth_pil is None:
+            if self.img_path is None:
+                raise ValueError("Image path is not set. Call update_image(img_path) first.")
+            depth_path = self._depth_path_from_rgb_path(self.img_path)
+            if not os.path.exists(depth_path):
+                raise FileNotFoundError(f"Depth path {depth_path} does not exist.")
+            depth = Image.open(depth_path)
+            if depth.mode != 'L':
+                depth = depth.convert('L')
+            depth = F.resize(depth, self.resize, interpolation=Image.NEAREST)
+            self._depth_pil = depth
+        return self._depth_pil
+
+    def _depth_path_from_rgb_path(self, rgb_path: str) -> str:
+        rgb_path = os.fspath(rgb_path)
+        # Expected: .../<split>/images/<frame>.png -> .../<split>/depths/<frame>_depth.png
+        depth_path = rgb_path.replace(f"{os.sep}images{os.sep}", f"{os.sep}depths{os.sep}")
+        root, ext = os.path.splitext(depth_path)
+        return f"{root}_depth{ext}"
+
+    def _get_rgb_tensor(self) -> torch.Tensor:
+        if self._rgb_tensor is None:
+            rgb = np.asarray(self._get_rgb_pil(), dtype=np.float32) / 255.0
             self._rgb_tensor = torch.from_numpy(rgb).permute(2, 0, 1).to(DEVICE)
         return self._rgb_tensor
 
@@ -65,6 +93,68 @@ class tools_api:
         self._resized_mask_cache[key] = resized
         return resized
 
+    def _mask_bbox_xywh(self, mask_array: np.ndarray) -> tuple[int, int, int, int]:
+        rows = np.any(mask_array > 0, axis=1)
+        cols = np.any(mask_array > 0, axis=0)
+
+        if not np.any(rows) or not np.any(cols):
+            return 0, 0, 0, 0
+
+        y_min, y_max = np.where(rows)[0][[0, -1]]
+        x_min, x_max = np.where(cols)[0][[0, -1]]
+        return int(x_min), int(y_min), int(x_max - x_min), int(y_max - y_min)
+
+    def _siamese_branch_inputs(self, mask: Mask, crop_size: tuple[int, int] = (224, 224)) -> tuple[torch.Tensor, torch.Tensor]:
+        mask_array = mask.decode_mask()
+        mask_h, mask_w = mask_array.shape[:2]
+        x, y, w, h = self._mask_bbox_xywh(mask_array)
+
+        geo_vector = torch.tensor(
+            [
+                (x + w / 2) / max(mask_w, 1),
+                (y + h / 2) / max(mask_h, 1),
+                w / max(mask_w, 1),
+                h / max(mask_h, 1),
+                (w * h) / max(mask_w * mask_h, 1),
+            ],
+            dtype=torch.float32,
+        )
+
+        rgb_resized = self._get_rgb_pil()
+        depth_resized = self._get_depth_pil()
+        resized_w, resized_h = rgb_resized.size
+
+        scale_x = resized_w / max(mask_w, 1)
+        scale_y = resized_h / max(mask_h, 1)
+        x_s = int(x * scale_x)
+        y_s = int(y * scale_y)
+        w_s = max(1, int(w * scale_x))
+        h_s = max(1, int(h * scale_y))
+
+        pad_factor = 0.1
+        pad_x = int(w_s * pad_factor)
+        pad_y = int(h_s * pad_factor)
+
+        x1 = max(0, x_s - pad_x)
+        y1 = max(0, y_s - pad_y)
+        x2 = min(resized_w, x_s + w_s + pad_x)
+        y2 = min(resized_h, y_s + h_s + pad_y)
+        if x2 <= x1 or y2 <= y1:
+            x1, y1, x2, y2 = 0, 0, resized_w, resized_h
+
+        rgb_crop = rgb_resized.crop((x1, y1, x2, y2))
+        depth_crop = depth_resized.crop((x1, y1, x2, y2))
+
+        rgb_crop = F.resize(rgb_crop, crop_size, interpolation=Image.BILINEAR)
+        depth_crop = F.resize(depth_crop, crop_size, interpolation=Image.BILINEAR)
+
+        rgb_tensor = F.to_tensor(rgb_crop)
+        depth_tensor = F.to_tensor(depth_crop)
+        rgb_tensor = (rgb_tensor - IMAGENET_MEAN) / IMAGENET_STD
+
+        img_tensor = torch.cat([rgb_tensor, depth_tensor], dim=0)
+        return img_tensor, geo_vector
+
     def dist(self, mask_1: Mask, mask_2: Mask) -> float:
 
         if mask_1.object_class.lower() == 'buffer' and self.inside(mask_1, [mask_2]):
@@ -73,28 +163,17 @@ class tools_api:
         if mask_2.object_class.lower() == 'buffer' and self.inside(mask_2, [mask_1]):
             return 0.0
 
-        rgb = self._get_rgb_tensor()
-
-        # Decode and resize masks
-        mask1_resized = self._get_resized_mask(mask_1)
-        mask2_resized = self._get_resized_mask(mask_2)
-        mask1_tensor = torch.from_numpy(mask1_resized).to(rgb.device).unsqueeze(0)
-        mask2_tensor = torch.from_numpy(mask2_resized).to(rgb.device).unsqueeze(0)
-
-        # Stack inputs: 1 x C x H x W
-        input_tensor = torch.cat([rgb, mask1_tensor, mask2_tensor], dim=0).unsqueeze(0)
+        img_a, geo_a = self._siamese_branch_inputs(mask_1)
+        img_b, geo_b = self._siamese_branch_inputs(mask_2)
+        img_a = img_a.to(DEVICE).unsqueeze(0)
+        geo_a = geo_a.to(DEVICE).unsqueeze(0)
+        img_b = img_b.to(DEVICE).unsqueeze(0)
+        geo_b = geo_b.to(DEVICE).unsqueeze(0)
 
         with torch.no_grad():
-            predicted_distance = self.model(input_tensor).item()
+            predicted_distance = float(self.model(img_a, geo_a, img_b, geo_b).item())
 
-        if predicted_distance < self.cascade_dist_thres:
-            with torch.no_grad():
-                predicted_distance = self.small_dist_model(input_tensor).item()
-            if predicted_distance < self.clamp_distance_thres:
-                predicted_distance = 0.0
-
-        predicted_distance = predicted_distance / 100.0
-
+        predicted_distance = max(0.0, predicted_distance)
         return round(predicted_distance, 2)
 
 
@@ -108,30 +187,29 @@ class tools_api:
     def closest(self, mask_A: Mask, masks: List[Mask]) -> str:
         if not masks:
             raise ValueError("No masks provided to find the closest mask.")
-        rgb = self._get_rgb_tensor()
 
-        # Decode and resize mask_A
-        maskA_resized = self._get_resized_mask(mask_A)
-        maskA_tensor = torch.from_numpy(maskA_resized).to(rgb.device).unsqueeze(0)
+        img_a, geo_a = self._siamese_branch_inputs(mask_A)
+        img_a = img_a.to(DEVICE)
+        geo_a = geo_a.to(DEVICE)
 
-        base = torch.cat([rgb, maskA_tensor], dim=0)  # 4 x H x W
-        base_batch = base.unsqueeze(0).expand(len(masks), -1, -1, -1)  # N x 4 x H x W
-        maskB_batch = torch.stack(
-            [torch.from_numpy(self._get_resized_mask(m)) for m in masks],
-            dim=0,
-        ).to(rgb.device).unsqueeze(1)  # N x 1 x H x W
-        batch_tensor = torch.cat([base_batch, maskB_batch], dim=1)  # N x 5 x H x W
+        img_b_list = []
+        geo_b_list = []
+        for m in masks:
+            img_b, geo_b = self._siamese_branch_inputs(m)
+            img_b_list.append(img_b)
+            geo_b_list.append(geo_b)
 
-        # Model inference
+        img_b_batch = torch.stack(img_b_list, dim=0).to(DEVICE)
+        geo_b_batch = torch.stack(geo_b_list, dim=0).to(DEVICE)
+        img_a_batch = img_a.unsqueeze(0).expand(len(masks), -1, -1, -1)
+        geo_a_batch = geo_a.unsqueeze(0).expand(len(masks), -1)
+
         with torch.no_grad():
-            predicted_distances = self.model(batch_tensor).cpu().numpy()
+            predicted_distances = self.model(img_a_batch, geo_a_batch, img_b_batch, geo_b_batch).squeeze(1)
+            predicted_distances = torch.clamp(predicted_distances, min=0.0)
 
-        # Find the mask with the smallest predicted distance
-        predicted_distances = predicted_distances / 100.0  # scale back to meters if needed
-        min_index = np.argmin(predicted_distances)
-        closest_mask = masks[min_index]
-
-        return closest_mask.mask_name()
+        min_index = int(torch.argmin(predicted_distances).item())
+        return masks[min_index].mask_name()
 
 
     def is_left(self, mask_A: Mask, mask_B: Mask) -> bool:
