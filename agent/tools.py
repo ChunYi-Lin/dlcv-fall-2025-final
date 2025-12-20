@@ -11,45 +11,25 @@ from distance_est.model import build_dist_model
 from inside_pred.model import build_inside_model
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-IMAGENET_MEAN = [0.485, 0.456, 0.406]
-IMAGENET_STD = [0.229, 0.224, 0.225]
 
 class tools_api:
-    def __init__(
-        self,
-        dist_model_cfg,
-        inside_model_cfg,
-        small_dist_model_cfg=None,
-        resize=(360, 640),
-        mask_IoU_thres=0.3,
-        inside_thres=0.5,
-        cascade_dist_thres=3.0,
-        clamp_distance_thres=0.25,
-        img_path=None,
-        crop_size=(224, 224),
-    ):
+    def __init__(self, dist_model_cfg, inside_model_cfg, small_dist_model_cfg, resize=(360,640), mask_IoU_thres=0.3, inside_thres=0.5, cascade_dist_thres=300, clamp_distance_thres=25, img_path=None):
         self.model = build_dist_model(dist_model_cfg)
         self.inside_model = build_inside_model(inside_model_cfg)
-        self.small_dist_model = build_dist_model(small_dist_model_cfg) if small_dist_model_cfg else None
+        self.small_dist_model = build_dist_model(small_dist_model_cfg)
         self.resize = resize
-        self.crop_size = crop_size
         self.mask_IoU_thres = mask_IoU_thres
         self.inside_thres = inside_thres
         self.cascade_dist_thres = cascade_dist_thres
         self.clamp_distance_thres = clamp_distance_thres
         self.img_path = img_path
-        self.depth_path = None
         self.masks = None
         self._rgb_tensor = None
-        self._rgb_pil_resized = None
-        self._depth_pil_resized = None
         self._resized_mask_cache: Dict[Tuple[int, Tuple[int, int]], np.ndarray] = {}
-        self._dist_input_cache: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
     
     def update_masks(self, masks: Dict[str, Mask]):
         self.masks = masks
         self._resized_mask_cache.clear()
-        self._dist_input_cache.clear()
 
     def update_image(self, img_path):
         img_path = os.fspath(img_path)
@@ -57,44 +37,17 @@ class tools_api:
             return
         self.img_path = img_path
         assert os.path.exists(self.img_path), f"Image path {self.img_path} does not exist."
-        self.depth_path = self._infer_depth_path(self.img_path)
         self._rgb_tensor = None
-        self._rgb_pil_resized = None
-        self._depth_pil_resized = None
-        self._dist_input_cache.clear()
         self._get_rgb_tensor()
-
-    def _infer_depth_path(self, rgb_path: str) -> str:
-        rgb_dir = os.path.dirname(rgb_path)
-        parent_dir = os.path.dirname(rgb_dir)
-        depth_dir = os.path.join(parent_dir, 'depths')
-        basename = os.path.basename(rgb_path)
-        depth_name = basename.replace('.png', '_depth.png')
-        return os.path.join(depth_dir, depth_name)
-
-    def _ensure_resized_images_loaded(self) -> None:
-        if self._rgb_pil_resized is not None and self._depth_pil_resized is not None:
-            return
-        if self.img_path is None:
-            raise ValueError("Image path is not set. Call update_image(img_path) first.")
-
-        rgb = Image.open(self.img_path).convert('RGB')
-        self._rgb_pil_resized = F.resize(rgb, self.resize)
-
-        depth_img = None
-        if self.depth_path and os.path.exists(self.depth_path):
-            depth_img = Image.open(self.depth_path)
-            if depth_img.mode != 'L':
-                depth_img = depth_img.convert('L')
-        if depth_img is None:
-            depth_img = Image.new('L', self._rgb_pil_resized.size, 0)
-
-        self._depth_pil_resized = F.resize(depth_img, self.resize, interpolation=Image.BILINEAR)
 
     def _get_rgb_tensor(self) -> torch.Tensor:
         if self._rgb_tensor is None:
-            self._ensure_resized_images_loaded()
-            self._rgb_tensor = F.to_tensor(self._rgb_pil_resized).to(DEVICE)
+            if self.img_path is None:
+                raise ValueError("Image path is not set. Call update_image(img_path) first.")
+            rgb = Image.open(self.img_path).convert('RGB')
+            rgb = F.resize(rgb, self.resize)
+            rgb = np.asarray(rgb, dtype=np.float32) / 255.0
+            self._rgb_tensor = torch.from_numpy(rgb).permute(2, 0, 1).to(DEVICE)
         return self._rgb_tensor
 
     def _get_resized_mask(self, mask: Mask) -> np.ndarray:
@@ -112,80 +65,6 @@ class tools_api:
         self._resized_mask_cache[key] = resized
         return resized
 
-    def _bbox_from_mask(self, mask_array: np.ndarray) -> Tuple[int, int, int, int]:
-        ys, xs = np.where(mask_array > 0)
-        if xs.size == 0 or ys.size == 0:
-            return 0, 0, 0, 0
-        x_min, x_max = int(xs.min()), int(xs.max())
-        y_min, y_max = int(ys.min()), int(ys.max())
-        return x_min, y_min, x_max - x_min + 1, y_max - y_min + 1
-
-    def _prepare_dist_inputs(self, mask: Mask) -> Tuple[torch.Tensor, torch.Tensor]:
-        cached = self._dist_input_cache.get(id(mask))
-        if cached is not None:
-            return cached
-
-        self._ensure_resized_images_loaded()
-
-        mask_array = mask.decode_mask()
-        orig_h, orig_w = mask_array.shape
-        x, y, w, h = self._bbox_from_mask(mask_array)
-
-        if w <= 0 or h <= 0:
-            img_tensor = torch.zeros((4, *self.crop_size), dtype=torch.float32, device=DEVICE)
-            geo_vector = torch.zeros((5,), dtype=torch.float32, device=DEVICE)
-            self._dist_input_cache[id(mask)] = (img_tensor, geo_vector)
-            return img_tensor, geo_vector
-
-        geo_vector = torch.tensor(
-            [
-                (x + w / 2) / orig_w,
-                (y + h / 2) / orig_h,
-                w / orig_w,
-                h / orig_h,
-                (w * h) / (orig_w * orig_h),
-            ],
-            dtype=torch.float32,
-            device=DEVICE,
-        )
-
-        resized_w, resized_h = self._rgb_pil_resized.size
-        scale_x = resized_w / orig_w
-        scale_y = resized_h / orig_h
-
-        x_s = int(round(x * scale_x))
-        y_s = int(round(y * scale_y))
-        w_s = int(round(w * scale_x))
-        h_s = int(round(h * scale_y))
-
-        pad_factor = 0.1
-        pad_x = int(round(w_s * pad_factor))
-        pad_y = int(round(h_s * pad_factor))
-
-        x1 = max(0, x_s - pad_x)
-        y1 = max(0, y_s - pad_y)
-        x2 = min(resized_w, x_s + w_s + pad_x)
-        y2 = min(resized_h, y_s + h_s + pad_y)
-
-        if x2 <= x1 or y2 <= y1:
-            img_tensor = torch.zeros((4, *self.crop_size), dtype=torch.float32, device=DEVICE)
-            self._dist_input_cache[id(mask)] = (img_tensor, geo_vector)
-            return img_tensor, geo_vector
-
-        rgb_crop = self._rgb_pil_resized.crop((x1, y1, x2, y2))
-        depth_crop = self._depth_pil_resized.crop((x1, y1, x2, y2))
-
-        rgb_crop = F.resize(rgb_crop, self.crop_size, interpolation=Image.BILINEAR)
-        depth_crop = F.resize(depth_crop, self.crop_size, interpolation=Image.BILINEAR)
-
-        rgb_tensor = F.to_tensor(rgb_crop)
-        rgb_tensor = F.normalize(rgb_tensor, mean=IMAGENET_MEAN, std=IMAGENET_STD)
-        depth_tensor = F.to_tensor(depth_crop)
-
-        img_tensor = torch.cat([rgb_tensor, depth_tensor], dim=0).to(DEVICE)
-        self._dist_input_cache[id(mask)] = (img_tensor, geo_vector)
-        return img_tensor, geo_vector
-
     def dist(self, mask_1: Mask, mask_2: Mask) -> float:
 
         if mask_1.object_class.lower() == 'buffer' and self.inside(mask_1, [mask_2]):
@@ -194,30 +73,27 @@ class tools_api:
         if mask_2.object_class.lower() == 'buffer' and self.inside(mask_2, [mask_1]):
             return 0.0
 
-        img_a, geo_a = self._prepare_dist_inputs(mask_1)
-        img_b, geo_b = self._prepare_dist_inputs(mask_2)
+        rgb = self._get_rgb_tensor()
 
-        with torch.inference_mode():
-            preds = self.model(
-                img_a.unsqueeze(0),
-                geo_a.unsqueeze(0),
-                img_b.unsqueeze(0),
-                geo_b.unsqueeze(0),
-            )
-            predicted_distance = float(preds.squeeze().item())
+        # Decode and resize masks
+        mask1_resized = self._get_resized_mask(mask_1)
+        mask2_resized = self._get_resized_mask(mask_2)
+        mask1_tensor = torch.from_numpy(mask1_resized).to(rgb.device).unsqueeze(0)
+        mask2_tensor = torch.from_numpy(mask2_resized).to(rgb.device).unsqueeze(0)
 
-        if self.small_dist_model is not None and predicted_distance < self.cascade_dist_thres:
-            with torch.inference_mode():
-                preds = self.small_dist_model(
-                    img_a.unsqueeze(0),
-                    geo_a.unsqueeze(0),
-                    img_b.unsqueeze(0),
-                    geo_b.unsqueeze(0),
-                )
-                predicted_distance = float(preds.squeeze().item())
+        # Stack inputs: 1 x C x H x W
+        input_tensor = torch.cat([rgb, mask1_tensor, mask2_tensor], dim=0).unsqueeze(0)
 
-        if predicted_distance < self.clamp_distance_thres:
-            predicted_distance = 0.0
+        with torch.no_grad():
+            predicted_distance = self.model(input_tensor).item()
+
+        if predicted_distance < self.cascade_dist_thres:
+            with torch.no_grad():
+                predicted_distance = self.small_dist_model(input_tensor).item()
+            if predicted_distance < self.clamp_distance_thres:
+                predicted_distance = 0.0
+
+        predicted_distance = predicted_distance / 100.0
 
         return round(predicted_distance, 2)
 
@@ -232,27 +108,30 @@ class tools_api:
     def closest(self, mask_A: Mask, masks: List[Mask]) -> str:
         if not masks:
             raise ValueError("No masks provided to find the closest mask.")
-        img_a, geo_a = self._prepare_dist_inputs(mask_A)
+        rgb = self._get_rgb_tensor()
 
-        img_bs = []
-        geo_bs = []
-        for m in masks:
-            img_b, geo_b = self._prepare_dist_inputs(m)
-            img_bs.append(img_b)
-            geo_bs.append(geo_b)
+        # Decode and resize mask_A
+        maskA_resized = self._get_resized_mask(mask_A)
+        maskA_tensor = torch.from_numpy(maskA_resized).to(rgb.device).unsqueeze(0)
 
-        img_b_batch = torch.stack(img_bs, dim=0)
-        geo_b_batch = torch.stack(geo_bs, dim=0)
-        img_a_batch = img_a.unsqueeze(0).repeat(len(masks), 1, 1, 1)
-        geo_a_batch = geo_a.unsqueeze(0).repeat(len(masks), 1)
+        base = torch.cat([rgb, maskA_tensor], dim=0)  # 4 x H x W
+        base_batch = base.unsqueeze(0).expand(len(masks), -1, -1, -1)  # N x 4 x H x W
+        maskB_batch = torch.stack(
+            [torch.from_numpy(self._get_resized_mask(m)) for m in masks],
+            dim=0,
+        ).to(rgb.device).unsqueeze(1)  # N x 1 x H x W
+        batch_tensor = torch.cat([base_batch, maskB_batch], dim=1)  # N x 5 x H x W
 
-        with torch.inference_mode():
-            preds = self.model(img_a_batch, geo_a_batch, img_b_batch, geo_b_batch)
-            predicted_distances = preds.squeeze(1).detach().cpu().numpy()
+        # Model inference
+        with torch.no_grad():
+            predicted_distances = self.model(batch_tensor).cpu().numpy()
 
-        predicted_distances = np.maximum(predicted_distances, 0.0)
-        min_index = int(np.argmin(predicted_distances))
-        return masks[min_index].mask_name()
+        # Find the mask with the smallest predicted distance
+        predicted_distances = predicted_distances / 100.0  # scale back to meters if needed
+        min_index = np.argmin(predicted_distances)
+        closest_mask = masks[min_index]
+
+        return closest_mask.mask_name()
 
 
     def is_left(self, mask_A: Mask, mask_B: Mask) -> bool:
@@ -292,8 +171,8 @@ class tools_api:
         with torch.no_grad():
             # Output: logits, convert to 0/1 using torch.round on sigmoid
             logits = self.inside_model(batch_tensor)
-            probs = torch.sigmoid(logits)
-            preds = (probs > self.inside_thres).long().cpu().numpy()  # 1: inside, 0: outside
+            preds = torch.sigmoid(logits)
+            preds = torch.round(preds).long().cpu().numpy()  # 1: inside, 0: outside
 
         count = int(preds.sum())
         return count
