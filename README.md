@@ -91,12 +91,9 @@ cd agent
 python3 agent_run.py --output_path ../output/test.json --model <model_name_or_path> --device_map auto --dtype bf16
 ```
 
-## ⚒️ QA Data Pre-processing and Model Training (Optional)
+## ⚒️ QA Data Pre-processing and Model Training
 
 ### 0. QA Data Pre-processing
-
-To pre-process the QA, you need to update the below script with your Google API key.
-Note that this step is optional because data.zip already provide the processed QA data.
 
 ```
 python3 utils/question_rephrase.py --split test --model ./Qwen2.5-72B-Instruct-AWQ/ --llm_backend vllm
