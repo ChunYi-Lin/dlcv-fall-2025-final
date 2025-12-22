@@ -1,12 +1,4 @@
-# SpatialAgent
-
-**1st Place Solution of the ICCV 2025 AI City Challenge, Track 3.**
-
-📄 **[ICCVW 2025 Paper](https://openaccess.thecvf.com/content/ICCV2025W/AICity/papers/Huang_Warehouse_Spatial_Question_Answering_with_LLM_Agent_1st_Place_Solution_ICCVW_2025_paper.pdf)**
-
-<p align="center">
-  <img src="asset/leaderboard.png" alt="Leaderboard Result"/>
-</p>
+# 3CE_team
 
 ---
 
@@ -14,8 +6,8 @@
 
 1. Clone the repository  
 
-       git clone https://github.com/hsiangwei0903/SpatialAgent.git
-       cd SpatialAgent
+       git clone -b feature/integrate-teammate-models https://github.com/ChunYi-Lin/dlcv-fall-2025-final
+       cd dlcv-fall-2025-final
 
 2. Create and activate a conda environment with Python 3.10
 
@@ -26,37 +18,54 @@
 
        pip install torch==2.2.1 torchvision==0.17.1 torchaudio==2.2.1 --index-url https://download.pytorch.org/whl/cu118
        pip install -r requirements.txt
-
+       pip install autoawq
+       pip install vllm
 ---
 
 ## 📦 Preparation
 
-1. Model checkpoints and pre-processed QA data can be downloaded from [here](<https://drive.google.com/drive/u/1/folders/1_ovPjqADpvM0fQdNBLAPdWiemC5MFaG7>).
+1. Model checkpoints be downloaded using:
+
+       gdown -O best_acc_model.pth 1q6aFUsTs6BYcYsxuiWtBRUJzVOQ6Jl40
+       gdown -O best_loss_model.pth 1pgZqm9J9oV_hbd46SqhhW3XKHMCjlWPr
+       gdown -O epoch_4.pth 1TExckowE8RjfTsEzV5uzLmJx6_q-NwiC
 
 2. Place the downloaded files in corresponding directory following the below Project Structure.
 
-3. Download the [AI City Challenge PhysicalAI Spatial Intelligence dataset](https://huggingface.co/datasets/nvidia/PhysicalAI-Spatial-Intelligence-Warehouse) and put in data dir following project structure.
+3. Download the [DLCV_Final1](https://huggingface.co/datasets/yaguchi27/DLCV_Final1) and put in data dir following project structure.
 
 ---
 
 ## 📂 Project Structure
 
-    SpatialAgent
-    ├── agent
+    dlcv-fall-2025-final/
+    ├── agent/
+    │   └── agent_run.py
     ├── distance_est/
-    │   └──  ckpt/
-    │       ├── 3m_epoch6.pth
-    │       └── epoch_5_iter_6831.pth
+    │   └── ckpt/
+    │       ├── best_acc_model.pth
+    │       └── best_loss_model.pth
     ├── inside_pred/
     │   └── ckpt/
     │       └── epoch_4.pth
-    ├── utils
+    ├── utils/
     ├── data/
-    │   ├── train
-    │   ├── val
+    │   ├── train/
+    │   │   ├── images/
+    │   │   ├── depths/
+    │   │   └── train.json
+    │   ├── val/
+    │   │   ├── images/
+    │   │   ├── depths/
+    │   │   └── val.json
     │   └── test/
-    │       └── images/
-    │       └── depths/
+    │       ├── images/
+    │       ├── depths/
+    │       └── test.json
+    ├── output/
+    ├── Qwen2.5-72B-Instruct-AWQ/
+    ├── download_model.py
+    ├── requirements.txt
     └── README.md
 
 ---
@@ -66,15 +75,20 @@
 ### 1. Inference on test set
 
 ```bash
-cd agent
-python agent_run.py --output_path ../output/test.json --quantization none
+python3 agent/agent_run.py --split test \
+               --model ./Qwen2.5-72B-Instruct-AWQ \
+               --output_path ./output/test.json \
+               --max_new_tokens 4096 \
+               --do_sample \
+               --temperature 0.2 \
+               --llm_backend vllm
 ```
 
 You can swap the LLM with any Hugging Face Transformers causal LM (local path or hub id):
 
 ```bash
 cd agent
-python agent_run.py --output_path ../output/test.json --model <model_name_or_path> --device_map auto --dtype bf16
+python3 agent_run.py --output_path ../output/test.json --model <model_name_or_path> --device_map auto --dtype bf16
 ```
 
 ## ⚒️ QA Data Pre-processing and Model Training (Optional)
@@ -85,34 +99,26 @@ To pre-process the QA, you need to update the below script with your Google API 
 Note that this step is optional because data.zip already provide the processed QA data.
 
 ```
-python utils/question_rephrase.py --split val
-python utils/question_rephrase.py --split train
-python utils/question_rephrase.py --split test
+python3 utils/question_rephrase.py --split test --model ./Qwen2.5-72B-Instruct-AWQ/ --llm_backend vllm
 ```
 
 
 We provide the pre-trained model checkpoint, but we also provide the training script of our model as follows.
 
-### 1. Train the distance estimation model
+### 1. Train the inclusion classification model
 
 ```
-cd distance_est
-python train.py
-```
-
-### 2. Train the inclusion classification model
-
-```
+cd utils
+python3 organize_inside.py
+cd ..
 cd inside_pred
-python train.py
+python3 train.py
 ```
 
 
 ---
 
-## 📚 Citation
-
-If you find this work useful, please cite our ICCV Workshop 2025 paper, thank you!
+## 📚 Reference
 
 ```bibtex
 @InProceedings{Huang_2025_ICCV,
