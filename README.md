@@ -217,8 +217,6 @@ git clone https://github.com/ChunYi-Lin/dlcv-fall-2025-final.git
 cd dlcv-fall-2025-final
 ```
 
-> Until this branch is merged into `main`, use `git checkout feature/integrate-teammate-models` after cloning.
-
 Create a Python 3.10 environment:
 
 ```bash
