@@ -29,7 +29,7 @@ def build_inside_model(model_cfg):
 class ResNet50Binary(nn.Module):
     def __init__(self, in_channels=5):
         super().__init__()
-        self.resnet = models.resnet50(weights='IMAGENET1K_V1')
+        self.resnet = models.resnet50(weights=None)
         # Change input conv layer to accept in_channels
         self.resnet.conv1 = nn.Conv2d(in_channels, 64, kernel_size=7, stride=2, padding=3, bias=False)
         # Binary classification head
